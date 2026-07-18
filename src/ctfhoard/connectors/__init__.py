@@ -14,15 +14,15 @@ from ctfhoard.connectors.base import Connector
 
 # module name (under ctfhoard.connectors) -> friendly CLI name is derived from the
 # connector's own `.name`. Add new connectors here.
+# Only real connector modules. Sources like sajjadium / pwncollege / NYU-bench are
+# ingested through `git_repo` (via seeds/official_repos.yaml), not as separate
+# connectors; GitHub-wide discovery lives in `ctfhoard.discover` (a module + the
+# `discover-github` CLI command), not here.
 _MODULES = [
     "juiceshop",
     "hackropole",
-    "nyu_ctf_bench",
     "git_repo",
-    "sajjadium",
-    "pwncollege",
     "ctftime",
-    "github_search",
 ]
 
 

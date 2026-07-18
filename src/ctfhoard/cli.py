@@ -118,6 +118,44 @@ def ingest(
         logger.info("parquet: {}", pq or "skipped (pyarrow missing)")
 
 
+@app.command("discover-github")
+def discover_github(
+    max_repos: int = typer.Option(
+        None, help="Cap the number of NEW repos discovered (default: no cap)."
+    ),
+    out: Path = typer.Option(
+        DEFAULT_DATA / "discovered_repos.jsonl",
+        help="Output JSONL path (consumed by the git_repo connector).",
+    ),
+    token: str = typer.Option(
+        None,
+        help="GitHub token; defaults to GH_TOKEN/GITHUB_TOKEN env or `gh auth token`.",
+    ),
+) -> None:
+    """Discover CTF challenge-source and writeup repos on GitHub into a JSONL list.
+
+    This is DISCOVERY only — it finds repositories, it does not extract challenges.
+    Feed the resulting file to the ``git_repo`` connector (``--discovered-path``) to
+    mirror and walk them.
+    """
+    from ctfhoard.discover import discover_all, resolve_token, write_discovered
+
+    resolved = resolve_token(token)
+    if not resolved:
+        logger.warning("no GitHub token found; unauthenticated search is heavily limited")
+
+    found = discover_all(token=resolved, max_repos=max_repos)
+    path = write_discovered(found.values(), out)
+
+    by_kind: dict[str, int] = {}
+    for cand in found.values():
+        by_kind[cand.kind] = by_kind.get(cand.kind, 0) + 1
+    logger.info("discovered {} repos -> {}", len(found), path)
+    typer.echo(f"discovered {len(found)} repos -> {path}")
+    for kind, n in sorted(by_kind.items(), key=lambda kv: -kv[1]):
+        typer.echo(f"  {kind:10} {n}")
+
+
 @app.command()
 def stats(data_dir: Path = typer.Option(DEFAULT_DATA, help="Root data directory.")) -> None:
     """Summarize the aggregate catalog across all connector shards."""

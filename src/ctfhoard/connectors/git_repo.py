@@ -379,12 +379,16 @@ class GitRepoConnector(Connector):
         seeds_path: Path | None = None,
         only: list[str] | None = None,
         max_challenges_per_repo: int | None = None,
+        discovered_path: Path | None = None,
     ) -> None:
         super().__init__(workdir)
         self.seeds_path = seeds_path or _DEFAULT_SEEDS
         self.only = set(only) if only else None
         self.max_challenges_per_repo = max_challenges_per_repo
+        self.discovered_path = discovered_path
         self.seeds = self._load_seeds()
+        if discovered_path is not None:
+            self.seeds.extend(self._load_discovered_seeds(discovered_path))
 
     def _load_seeds(self) -> list[dict]:
         """Flatten every seed section into one list of repo entries."""
@@ -398,6 +402,38 @@ class GitRepoConnector(Connector):
                     continue
                 seeds.append(entry)
         return seeds
+
+    def _load_discovered_seeds(self, path: Path) -> list[dict]:
+        """Turn a ``discover``-produced JSONL into seed entries appended to the walk.
+
+        Each :class:`~ctfhoard.discover.RepoCandidate` becomes a seed dict shaped like
+        the YAML seeds so :func:`walk_repo` handles it identically: ``kind`` carries the
+        inferred nature, ``license`` is left ``None`` (detected from the repo's own
+        LICENSE at clone time — the discovery SPDX is only a hint), and ``official`` is
+        ``False``. The ``only`` filter applies here too. Repos already present as
+        curated seeds are skipped so they are not walked twice.
+        """
+        from ctfhoard.discover import load_discovered
+
+        known = {s["repo"] for s in self.seeds}
+        extra: list[dict] = []
+        for cand in load_discovered(path):
+            repo = cand.full_name
+            if repo in known:
+                continue
+            if self.only is not None and repo not in self.only:
+                continue
+            known.add(repo)
+            extra.append(
+                {
+                    "repo": repo,
+                    "kind": cand.kind,
+                    "license": None,
+                    "official": False,
+                    "note": "discovered via github search",
+                }
+            )
+        return extra
 
     def discover(self) -> Iterator[RawChallenge]:
         for seed in self.seeds:
