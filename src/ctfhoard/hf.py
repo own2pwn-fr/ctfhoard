@@ -15,6 +15,7 @@ safe offline. The authentication token is read from the ``token`` argument or th
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import time
 from collections import Counter
@@ -26,40 +27,71 @@ HF_CORPUS_DATASET = "own2pwn-fr/ctfhoard-corpus"
 
 #: How many times to retry a folder upload before giving up.
 _MAX_UPLOAD_ATTEMPTS = 6
+#: Hard ceiling per upload attempt. HF's LFS/Xet upload can STALL — many idle
+#: connections, CPU and disk I/O at zero, no internal timeout — and hang the whole
+#: marathon forever. We run each attempt in a child process and terminate it past this
+#: deadline, then retry (upload is incremental, so the next attempt resumes).
+_UPLOAD_TIMEOUT_S = 1800.0
+
+
+def _upload_worker(queue, token: str, kwargs: dict) -> None:
+    """Child-process entrypoint: perform one ``upload_folder`` and report via queue."""
+    try:
+        from huggingface_hub import HfApi
+
+        url = HfApi(token=token).upload_folder(**kwargs)
+        queue.put(("ok", str(url)))
+    except Exception as exc:  # noqa: BLE001 — ship the failure back to the parent
+        queue.put(("err", f"{type(exc).__name__}: {exc}"))
 
 
 def _upload_folder_with_retry(resolved_token: str, **kwargs) -> str:
-    """``HfApi.upload_folder`` with retry on transient network failures.
+    """``HfApi.upload_folder`` with a hard per-attempt timeout + retry.
 
-    Large uploads occasionally hit a connection reset (``Connection reset by peer``)
-    that leaves huggingface_hub's underlying client closed, so a bare call dies with
-    "Cannot send a request, as the client has been closed". ``upload_folder`` is
-    incremental — it diffs against the remote and only sends missing files — so we
-    retry with a FRESH ``HfApi`` each attempt; successive tries resume where the last
-    left off and converge. Only a persistent failure (all attempts exhausted) raises.
+    Two failure modes are handled: a transient error (connection reset → client
+    closed) that raises, and a silent STALL where the upload hangs with no progress
+    and no internal timeout. Each attempt runs in a spawned child process joined with
+    :data:`_UPLOAD_TIMEOUT_S`; a hung child is terminated. ``upload_folder`` is
+    incremental (diffs the remote, sends only missing files), so a retry resumes where
+    the last attempt stopped and successive tries converge. Only after all attempts are
+    exhausted do we raise.
     """
-    from huggingface_hub import HfApi
-
-    last_exc: Exception | None = None
+    ctx = multiprocessing.get_context("spawn")
+    last_err = "unknown upload failure"
     for attempt in range(1, _MAX_UPLOAD_ATTEMPTS + 1):
-        try:
-            api = HfApi(token=resolved_token)  # fresh client per attempt
-            return str(api.upload_folder(**kwargs))
-        except Exception as exc:  # noqa: BLE001 — retry any transient upload failure
-            last_exc = exc
-            if attempt == _MAX_UPLOAD_ATTEMPTS:
-                break
+        queue: multiprocessing.Queue = ctx.Queue()
+        proc = ctx.Process(
+            target=_upload_worker, args=(queue, resolved_token, kwargs), daemon=True
+        )
+        proc.start()
+        proc.join(_UPLOAD_TIMEOUT_S)
+        if proc.is_alive():  # stalled — kill it and retry
+            proc.terminate()
+            proc.join(30)
+            if proc.is_alive():
+                proc.kill()
+            last_err = f"upload hung > {_UPLOAD_TIMEOUT_S:.0f}s (terminated)"
+        else:
+            try:
+                status, payload = queue.get_nowait()
+            except Exception:  # noqa: BLE001
+                status, payload = "err", f"worker exited ({proc.exitcode}) with no result"
+            if status == "ok":
+                return payload
+            last_err = payload
+        if attempt < _MAX_UPLOAD_ATTEMPTS:
             wait = min(60.0, 2.0**attempt)
             logger.warning(
                 "HF upload attempt {}/{} failed ({}); retrying in {}s",
                 attempt,
                 _MAX_UPLOAD_ATTEMPTS,
-                exc,
+                last_err,
                 wait,
             )
             time.sleep(wait)
-    assert last_exc is not None
-    raise last_exc
+    raise RuntimeError(
+        f"HF upload failed after {_MAX_UPLOAD_ATTEMPTS} attempts: {last_err}"
+    )
 
 
 class HFTokenError(RuntimeError):
