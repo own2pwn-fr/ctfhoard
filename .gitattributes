@@ -1,0 +1,36 @@
+# Git LFS: mirrored challenge artifacts are mostly binary and can be large.
+# Text (source code, writeups in .md/.txt/.html, catalog JSONL) stays in plain git
+# so it diffs and searches normally; only heavy/binary formats go to LFS.
+#
+# Scoped to data/corpus/ so LFS never swallows the project's own source tree.
+
+# Compiled binaries / objects
+data/corpus/** filter=lfs diff=lfs merge=lfs -text
+# ...but keep human-readable challenge/writeup content in plain git:
+data/corpus/**/*.md    !filter !diff !merge text
+data/corpus/**/*.txt   !filter !diff !merge text
+data/corpus/**/*.rst   !filter !diff !merge text
+data/corpus/**/*.html  !filter !diff !merge text
+data/corpus/**/*.json  !filter !diff !merge text
+data/corpus/**/*.yaml  !filter !diff !merge text
+data/corpus/**/*.yml   !filter !diff !merge text
+data/corpus/**/*.py    !filter !diff !merge text
+data/corpus/**/*.c     !filter !diff !merge text
+data/corpus/**/*.h     !filter !diff !merge text
+data/corpus/**/*.cpp   !filter !diff !merge text
+data/corpus/**/*.rs    !filter !diff !merge text
+data/corpus/**/*.go    !filter !diff !merge text
+data/corpus/**/*.js    !filter !diff !merge text
+data/corpus/**/*.ts    !filter !diff !merge text
+data/corpus/**/*.php   !filter !diff !merge text
+data/corpus/**/*.rb    !filter !diff !merge text
+data/corpus/**/*.java  !filter !diff !merge text
+data/corpus/**/*.sol   !filter !diff !merge text
+data/corpus/**/*.sh    !filter !diff !merge text
+data/corpus/**/*.asm   !filter !diff !merge text
+data/corpus/**/*.s     !filter !diff !merge text
+data/corpus/**/Dockerfile        !filter !diff !merge text
+data/corpus/**/docker-compose*   !filter !diff !merge text
+
+# Catalog shards are plain-git text (diff-friendly), even though under data/.
+data/catalog/**  !filter !diff !merge text

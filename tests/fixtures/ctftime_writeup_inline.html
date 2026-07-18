@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head><title>zigzag writeup by ret2school</title></head>
+<body>
+<ul class="breadcrumb">
+    <li><a href="/task/23295">zigzag</a> <span class="divider">/</span></li>
+    <li class="active">writeup</li>
+</ul>
+
+<div class="container">
+<div class="page-header"><h3>Writeup by ret2school</h3></div>
+
+<div class="well" id="id_description">
+        <p>## Introduction</p>
+        <p><code>zigzag</code> is a zig heap challenge from the corCTF 2022 event.
+        It uses the GeneralPurposeAllocator rather than the C allocator, which makes
+        the exploitation path unusual.</p>
+        <p>## TL; DR<br />- Understand the zig GeneralPurposeAllocator internals<br />
+        - Abuse a use-after-free to leak a heap pointer<br />
+        - Overwrite a function pointer to get code execution.</p>
+        <p>Final flag: <code>corctf{bl4Z1nGlY_f4sT!!}</code></p>
+</div>
+
+<div class="well"><a href="https://ret2school.github.io/post/zigzag/" target="_new" rel="nofollow noopener">Original writeup</a> (https://ret2school.github.io/post/zigzag/).</div>
+</div>
+</body>
+</html>

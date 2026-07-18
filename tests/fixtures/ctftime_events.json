@@ -1,0 +1,36 @@
+[
+  {
+    "id": 1656,
+    "ctf_id": 1006,
+    "title": "corCTF 2022",
+    "start": "2022-08-06T00:00:00+00:00",
+    "finish": "2022-08-08T00:00:00+00:00",
+    "weight": 68.51,
+    "format": "Jeopardy",
+    "format_id": 1,
+    "ctftime_url": "https://ctftime.org/event/1656",
+    "logo": "",
+    "url": "https://cor.team/",
+    "organizers": [{"id": 111931, "name": "Crusaders of Rust"}],
+    "participants": 978,
+    "duration": {"hours": 0, "days": 2},
+    "description": "The Crusaders of Rust are back with corCTF 2022."
+  },
+  {
+    "id": 2100,
+    "ctf_id": 2050,
+    "title": "Quiet CTF 2024",
+    "start": "2024-03-01T00:00:00+00:00",
+    "finish": "2024-03-02T00:00:00+00:00",
+    "weight": 0.0,
+    "format": "Jeopardy",
+    "format_id": 1,
+    "ctftime_url": "https://ctftime.org/event/2100",
+    "logo": "",
+    "url": "https://quiet.example/",
+    "organizers": [{"id": 222222, "name": "Quiet Org"}],
+    "participants": 3,
+    "duration": {"hours": 0, "days": 1},
+    "description": "An event with no published writeups."
+  }
+]
