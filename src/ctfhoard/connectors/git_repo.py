@@ -296,15 +296,59 @@ def _is_challenge_root(subdirs: list[Path]) -> bool:
 def _iter_challenge_dirs(root: Path) -> Iterator[Path]:
     """Yield every challenge directory beneath ``root`` (see module docstring).
 
-    The repo root goes through the *same* leaf logic as any nested directory
-    (:func:`_collect_challenge_dirs`), so a single-challenge repo is handled
-    correctly: a root with a ``challenge.json``, a root that directly owns artifacts
-    (no sub-dirs, e.g. a bare ``Dockerfile``+``app.py`` repo), or a component-only
-    root (``public``/``private``, ``src``/``deploy``) each yields exactly *one* leaf —
-    the root itself — instead of dropping the challenge or fragmenting it into its
-    parts. Only a genuine container root (event/year/category dirs) recurses.
+    The repo root is special-cased to **prefer sub-challenges** over collapsing the
+    whole repo into a single challenge. A multi-challenge archive — dozens/hundreds of
+    ``<event>/<challenge>/…`` nested dirs (cryptohack/ctf_archive, sajjadium/ctf-archives,
+    ctfs/write-ups, pwncollege/ctf-archive) — must fan out into its many nested challenge
+    dirs, never swallow the entire tree as one root challenge with ``path_in_repo == '.'``.
+    (Regression guarded against: a stray artifact at the archive root — e.g. cryptohack's
+    top-level ``docker_deploy.py`` — otherwise made ``_has_direct_artifacts(root)`` fire
+    and the root greedily emit itself as one giant challenge.)
+
+    Order of preference at the root:
+
+    * an explicit ``root/challenge.json`` short-circuits to exactly one challenge (the
+      repo genuinely *is* one challenge);
+    * otherwise recurse into the root's real (non-component) sub-dirs FIRST — if that
+      yields ONE OR MORE challenges, those are the result and the root is NOT emitted;
+    * ONLY when recursion yields ZERO challenges do we fall back to emitting the root
+      itself as a single challenge: the repo that *is* one challenge (artifacts at the
+      root, no challenge-bearing sub-dirs), a component-only root (``public``/``private``,
+      ``src``/``deploy``), or a kCTF wrapper (``attachments``/``challenge``/``healthcheck``).
+      In each of those the sub-dirs are the challenge's own *parts* (components), so
+      recursion into them yields nothing and the fallback correctly fires.
+
+    Nested directories keep the ordinary most-specific-leaf logic
+    (:func:`_collect_challenge_dirs`), so per-repo challenge counts below the root are
+    unchanged.
     """
-    yield from _collect_challenge_dirs(root)
+    if _is_noise(root.name):
+        return
+    # Cleanest signal: an explicit challenge.json at the very root = one challenge.
+    if (root / "challenge.json").is_file():
+        yield root
+        return
+    subdirs = sorted(p for p in root.iterdir() if p.is_dir() and not _is_noise(p.name))
+    # Prefer sub-challenges: recurse into the root's real sub-dirs first. Component
+    # sub-dirs are parts of a *single* root challenge (not sub-challenges), so they are
+    # skipped here — that is what lets a component-only / kCTF wrapper root fall through
+    # to the single-challenge fallback below instead of fragmenting into its parts.
+    produced = False
+    for child in subdirs:
+        if child.name.lower() in _COMPONENT_NAMES:
+            continue
+        for leaf in _collect_challenge_dirs(child):
+            produced = True
+            yield leaf
+    if produced:
+        return
+    # Fallback: recursion found no nested challenge, so the root itself is a single
+    # challenge when it owns artifacts directly or is a component-only / challenge-root
+    # (kCTF) layout whose sub-dirs are its components.
+    if _has_direct_artifacts(root) or (
+        _is_challenge_root(subdirs) and _subtree_has_artifacts(root)
+    ):
+        yield root
 
 
 def _collect_challenge_dirs(d: Path) -> Iterator[Path]:

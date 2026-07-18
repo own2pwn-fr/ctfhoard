@@ -251,6 +251,43 @@ def test_root_leaf_fix_preserves_multichallenge_walk(tmp_path: Path) -> None:
     assert {r.title for r in raws} == {"Target Practice", "babyphp", "nested"}
 
 
+def test_multichallenge_archive_root_does_not_collapse(tmp_path: Path) -> None:
+    """A multi-challenge archive root fans out into its nested challenges, not one leaf.
+
+    Regression for the cryptohack/ctf_archive collapse: a stray artifact at the archive
+    ROOT (there a top-level ``docker_deploy.py``) made ``_has_direct_artifacts(root)``
+    fire, so the whole repo was emitted as a SINGLE challenge titled after the repo with
+    ``path_in_repo == '.'`` and every file swallowed. The root must now PREFER its many
+    ``<event>/<chal>/…`` sub-challenges over collapsing.
+    """
+    root = tmp_path / "repo"
+    # Dozens-style archive: several events, each with nested challenge dirs.
+    for event, chals in {
+        "EventA-2023": ("alpha", "beta"),
+        "EventB-2024": ("gamma", "delta"),
+        "EventC-2025": ("epsilon",),
+    }.items():
+        for chal in chals:
+            _write(root / event / chal / "Dockerfile", "FROM ubuntu:22.04")
+            _write(root / event / chal / f"{chal}.py", "print('x')")
+    # A stray artifact + a README sitting at the very root (the collapse trigger).
+    _write(root / "docker_deploy.py", "import sys")
+    _write(root / "README.md", "# archive")
+
+    raws = list(walk_repo(root, _seed(), "cryptohack/ctf_archive", _SHA))
+
+    # One challenge per nested chal dir — never the collapsed root.
+    assert len(raws) == 5
+    titles = {r.title for r in raws}
+    assert titles == {"alpha", "beta", "gamma", "delta", "epsilon"}
+    # No leaf is the repo root: no empty/dot path_in_repo, none titled after the repo.
+    assert all(r.source.path_in_repo not in (None, "", ".") for r in raws)
+    assert "ctf_archive" not in titles
+    paths = {r.source.path_in_repo for r in raws}
+    assert "EventA-2023/alpha" in paths
+    assert "EventC-2025/epsilon" in paths
+
+
 # --- category derived from the challenge DIRECTORY NAME ----------------------
 
 
