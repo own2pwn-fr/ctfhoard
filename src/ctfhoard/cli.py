@@ -14,8 +14,11 @@ import typer
 from loguru import logger
 
 from ctfhoard.connectors import load_registry
+from ctfhoard.corpus import materialize_challenge
 from ctfhoard.dedup import cluster_by_fingerprint, merge_cluster
+from ctfhoard.http import PoliteClient, make_client
 from ctfhoard.normalize import normalize
+from ctfhoard.ratelimit import RateLimiter
 from ctfhoard.schema import Challenge
 from ctfhoard.storage import CatalogWriter, read_jsonl
 
@@ -54,6 +57,15 @@ def ingest(
     data_dir: Path = typer.Option(DEFAULT_DATA, help="Root data directory."),
     parquet: bool = typer.Option(False, help="Also write a Parquet export."),
     no_dedup: bool = typer.Option(False, help="Skip fingerprint deduplication."),
+    no_materialize: bool = typer.Option(
+        False, help="Skip writing hard copies of sources/writeups into data/corpus/."
+    ),
+    no_fetch_writeups: bool = typer.Option(
+        False, help="Do not follow external writeup links to store their content."
+    ),
+    writeup_delay: float = typer.Option(
+        1.0, help="Min seconds between external writeup fetches (be polite)."
+    ),
 ) -> None:
     """Run one connector end-to-end and write its catalog shard."""
     registry = load_registry()
@@ -75,6 +87,26 @@ def ingest(
         before = len(challenges)
         challenges = _dedup(challenges)
         logger.info("dedup collapsed {} -> {}", before, len(challenges))
+
+    if not no_materialize:
+        corpus_root = data_dir / "corpus"
+        client = (
+            None
+            if no_fetch_writeups
+            else PoliteClient(make_client(), RateLimiter(min_interval=writeup_delay))
+        )
+        try:
+            for ch in challenges:
+                raw_dir = (
+                    Path(ch.corpus_path)
+                    if ch.corpus_path and Path(ch.corpus_path).exists()
+                    else None
+                )
+                materialize_challenge(ch, corpus_root, raw_dir=raw_dir, client=client)
+        finally:
+            if client is not None:
+                client.close()
+        logger.info("materialized hard copies under {}", corpus_root)
 
     writer = CatalogWriter(data_dir / "catalog" / connector)
     writer.extend(challenges)

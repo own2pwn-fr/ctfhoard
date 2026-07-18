@@ -160,13 +160,18 @@ class Writeup(BaseModel):
     title: str | None = Field(default=None)
     text: str | None = Field(
         default=None,
-        description="Full writeup text when inline/scrapable. None when we only hold "
-        "a reference link (e.g. CTFtime 'ai-train=no' content kept as reference).",
+        description="Full writeup text when inline/scrapable. May be dropped from the "
+        "catalog once the body is materialized to `local_path` to keep JSONL lean.",
     )
     is_inline: bool = Field(
         default=False,
-        description="True if `text` holds the writeup body; False if this is a "
-        "reference link only.",
+        description="True if the writeup body was available inline at the source; "
+        "False if it was reached by following an external link.",
+    )
+    local_path: str | None = Field(
+        default=None,
+        description="Path (under data/corpus/) of the hard copy of this writeup's "
+        "content — the bytes are stored in the repo, not just referenced.",
     )
     rating: float | None = Field(default=None, description="Community rating if any.")
     language: str | None = Field(default=None, description="Natural language (ISO 639-1).")

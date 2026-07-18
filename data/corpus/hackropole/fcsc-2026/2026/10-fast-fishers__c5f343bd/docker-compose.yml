@@ -1,0 +1,12 @@
+services:
+  10-fast-fishers-app:
+    image: anssi/fcsc2026-web-10-fast-fishers-app:latest
+    ports:
+      - "8000:5000"
+
+  10-fast-fishers-bot:
+    image: anssi/fcsc2026-web-10-fast-fishers-bot:latest
+    ports:
+      - "4000:4000"
+    tmpfs:
+      - /tmp:mode=1733,exec
