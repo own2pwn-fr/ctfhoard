@@ -22,6 +22,7 @@ from loguru import logger
 
 from ctfhoard.dedup import is_source_file, sha256_bytes
 from ctfhoard.http import PoliteClient
+from ctfhoard.netguard import UnsafeUrlError, safe_get
 from ctfhoard.normalize import slugify
 from ctfhoard.schema import Challenge, FileEntry
 
@@ -62,9 +63,23 @@ def _writeup_ext(url: str | None, content_type: str | None) -> str:
 
 
 def _copy_sources(raw_dir: Path, dest: Path) -> None:
-    """Copy a connector's downloaded challenge tree into the corpus, minus VCS noise."""
+    """Copy a connector's downloaded challenge tree into the corpus, minus VCS noise.
+
+    Symlinks are never followed. A symlinked *file* is skipped outright; and any
+    entry whose resolved target escapes ``raw_dir`` — e.g. reached by descending
+    through a symlinked *directory* — is refused. This stops a malicious source
+    tree from exfiltrating host files (``/etc/passwd``, cloud creds) into the
+    published corpus.
+    """
+    root = raw_dir.resolve()
     for src in raw_dir.rglob("*"):
         if src.is_dir() or src.is_symlink():
+            continue
+        # Refuse anything that resolves outside raw_dir (symlinked-directory escape).
+        try:
+            if not src.resolve().is_relative_to(root):
+                continue
+        except OSError:
             continue
         rel = src.relative_to(raw_dir)
         if ".git" in rel.parts:
@@ -72,6 +87,19 @@ def _copy_sources(raw_dir: Path, dest: Path) -> None:
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, target)
+
+
+def _stream_client(client: PoliteClient):
+    """Return the httpx-style streaming client behind a ``PoliteClient`` wrapper.
+
+    :func:`ctfhoard.netguard.safe_get` needs the streaming API (``.stream``);
+    ``PoliteClient`` only exposes ``.get`` over its inner ``httpx.Client``. A client
+    that already exposes ``.stream`` (a raw httpx client or a test fake) is used as
+    is. Returns None when no streaming client can be found.
+    """
+    if hasattr(client, "stream"):
+        return client
+    return getattr(client, "_client", None)
 
 
 def materialize_challenge(
@@ -99,28 +127,25 @@ def materialize_challenge(
         _copy_sources(Path(raw_dir), dest)
 
     # Materialize writeups as hard copies under <challenge>/writeups/.
+    wdir = dest / "writeups"
     if challenge.writeups:
-        wdir = dest / "writeups"
         wdir.mkdir(exist_ok=True)
+        streamer = _stream_client(client) if client is not None else None
+        kept: set[str] = set()
         for i, wu in enumerate(challenge.writeups):
             content: bytes | None = None
             ext = ".md"
             if wu.text:  # body already available inline at the source
                 content = wu.text.encode("utf-8")
                 ext = ".md"
-            elif wu.url and client is not None:  # follow the external link, grab bytes
-                try:
-                    resp = client.get(str(wu.url))
-                    if resp.status_code == 200 and resp.content:
-                        content = resp.content
-                        ext = _writeup_ext(str(wu.url), resp.headers.get("content-type"))
-                except Exception as exc:  # noqa: BLE001 — one bad link must not abort
-                    logger.debug("writeup fetch failed for {}: {}", wu.url, exc)
+            elif wu.url and streamer is not None:  # follow the external link, grab bytes
+                content, ext = _fetch_writeup(streamer, client, str(wu.url))
 
             if content is None:
                 continue
             fname = f"writeup_{i:02d}{ext}"
             (wdir / fname).write_bytes(content)
+            kept.add(fname)
             rel = f"writeups/{fname}"
             wu.local_path = rel
             wu.text = None  # bytes now live on disk; keep the catalog lean
@@ -132,9 +157,54 @@ def materialize_challenge(
                     is_source=is_source_file(rel),
                 )
             )
+        _prune_writeups(wdir, kept)
+    elif wdir.exists():
+        # No writeups this run: drop any stale hard copies from a previous ingest.
+        _prune_writeups(wdir, set())
 
-    # Record corpus_path relative to the repo root when known (portable in the catalog).
-    challenge.corpus_path = (
-        str(dest.relative_to(repo_root)) if repo_root else str(dest)
-    )
+    # Record corpus_path relative to the repo root when known (portable in the
+    # catalog). Both sides are resolved so an absolute --data-dir still yields a
+    # repo-relative path (e.g. 'corpus/github/...') rather than a machine path.
+    if repo_root is not None:
+        try:
+            challenge.corpus_path = str(dest.resolve().relative_to(Path(repo_root).resolve()))
+        except ValueError:
+            challenge.corpus_path = str(dest)
+    else:
+        challenge.corpus_path = str(dest)
     return challenge
+
+
+def _fetch_writeup(streamer, client: PoliteClient, url: str) -> tuple[bytes | None, str]:
+    """Fetch one external writeup body through the SSRF-safe, byte-capped path.
+
+    Rate-limits via the wrapping ``PoliteClient``'s limiter when present, then
+    delegates to :func:`ctfhoard.netguard.safe_get`. Unsafe URLs (SSRF targets,
+    over-cap bodies) and transient fetch errors are logged and skipped — one bad
+    link must never abort the challenge. Returns ``(content_or_None, ext)``.
+    """
+    limiter = getattr(client, "_limiter", None)
+    if limiter is not None:
+        limiter.acquire()
+    try:
+        status, body, content_type = safe_get(streamer, url)
+    except UnsafeUrlError as exc:
+        logger.debug("skipping unsafe writeup url {}: {}", url, exc)
+        return None, ".md"
+    except Exception as exc:  # noqa: BLE001 — one bad link must not abort the challenge
+        logger.debug("writeup fetch failed for {}: {}", url, exc)
+        return None, ".md"
+    if status == 200 and body:
+        return body, _writeup_ext(url, content_type)
+    return None, ".md"
+
+
+def _prune_writeups(wdir: Path, kept: set[str]) -> None:
+    """Remove writeup hard copies not (re)written this run, so corpus == catalog.
+
+    Re-ingestion can leave a stale ``writeup_01.html`` that no catalog entry
+    references (fewer/renamed writeups than before); drop such orphans.
+    """
+    for existing in wdir.iterdir():
+        if existing.is_file() and existing.name not in kept:
+            existing.unlink()

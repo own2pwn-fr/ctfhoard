@@ -40,11 +40,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
+from loguru import logger
 
 from ctfhoard.connectors.base import Connector
-from ctfhoard.mirror import clone_pinned, detect_repo_license
+from ctfhoard.mirror import MirrorError, clone_pinned, detect_repo_license
 from ctfhoard.normalize import map_category
 from ctfhoard.schema import Category, LicenseInfo, Origin, RawChallenge, Source
+
+#: Upper bound on bytes read from an untrusted ``challenge.json``. A repo can ship a
+#: huge file named ``challenge.json``; a metadata probe must never slurp gigabytes, so
+#: anything larger than this is treated as absent (real metadata files are tiny).
+_MAX_CHALLENGE_JSON_BYTES: int = 1024 * 1024  # 1 MiB
+
+#: Default cap (megabytes) on a *discovered* repo's size before it is cloned. Generous
+#: (a legitimately large archive still fits) but finite, so an accidental multi-GB repo
+#: from open-ended discovery cannot exhaust the disk. Curated seeds are never capped.
+_DEFAULT_MAX_REPO_SIZE_MB: int = 2048
 
 #: Default location of the seed file (repo-root ``seeds/official_repos.yaml``).
 #: git_repo.py -> connectors -> ctfhoard -> src -> <repo root>.
@@ -194,15 +205,17 @@ def _all_subdirs_are_components(subdirs: list[Path]) -> bool:
 
 
 def _iter_challenge_dirs(root: Path) -> Iterator[Path]:
-    """Yield every challenge directory beneath ``root`` (see module docstring)."""
-    # A ``challenge.json`` at the root itself means the whole repo is one challenge.
-    if (root / "challenge.json").is_file():
-        yield root
-        return
-    for child in sorted(p for p in root.iterdir() if p.is_dir()):
-        if _is_noise(child.name):
-            continue
-        yield from _collect_challenge_dirs(child)
+    """Yield every challenge directory beneath ``root`` (see module docstring).
+
+    The repo root goes through the *same* leaf logic as any nested directory
+    (:func:`_collect_challenge_dirs`), so a single-challenge repo is handled
+    correctly: a root with a ``challenge.json``, a root that directly owns artifacts
+    (no sub-dirs, e.g. a bare ``Dockerfile``+``app.py`` repo), or a component-only
+    root (``public``/``private``, ``src``/``deploy``) each yields exactly *one* leaf —
+    the root itself — instead of dropping the challenge or fragmenting it into its
+    parts. Only a genuine container root (event/year/category dirs) recurses.
+    """
+    yield from _collect_challenge_dirs(root)
 
 
 def _collect_challenge_dirs(d: Path) -> Iterator[Path]:
@@ -237,6 +250,10 @@ def _load_challenge_json(d: Path) -> dict:
     if not path.is_file():
         return {}
     try:
+        # Guard against a pathological multi-GB ``challenge.json``: a real metadata
+        # file is tiny, so anything over the cap is treated as absent rather than read.
+        if path.stat().st_size > _MAX_CHALLENGE_JSON_BYTES:
+            return {}
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (ValueError, OSError):
         return {}
@@ -331,6 +348,11 @@ def walk_repo(
         cj = _load_challenge_json(chal_dir)
         title, event_name, edition, year, raw_category = _derive_meta(segments, cj)
 
+        # Root itself is the challenge leaf (single-challenge repo): the relative path
+        # is empty, so derive the title from the repo name rather than "unknown".
+        if not segments:
+            title = str(cj.get("name") or repo.split("/")[-1])
+
         # Origin-specific event naming when the path alone is uninformative.
         if event_name is None:
             event_name = (
@@ -380,12 +402,14 @@ class GitRepoConnector(Connector):
         only: list[str] | None = None,
         max_challenges_per_repo: int | None = None,
         discovered_path: Path | None = None,
+        max_repo_size_mb: int = _DEFAULT_MAX_REPO_SIZE_MB,
     ) -> None:
         super().__init__(workdir)
         self.seeds_path = seeds_path or _DEFAULT_SEEDS
         self.only = set(only) if only else None
         self.max_challenges_per_repo = max_challenges_per_repo
         self.discovered_path = discovered_path
+        self.max_repo_size_mb = max_repo_size_mb
         self.seeds = self._load_seeds()
         if discovered_path is not None:
             self.seeds.extend(self._load_discovered_seeds(discovered_path))
@@ -416,12 +440,23 @@ class GitRepoConnector(Connector):
         from ctfhoard.discover import load_discovered
 
         known = {s["repo"] for s in self.seeds}
+        cap_kb = self.max_repo_size_mb * 1024
         extra: list[dict] = []
         for cand in load_discovered(path):
             repo = cand.full_name
             if repo in known:
                 continue
             if self.only is not None and repo not in self.only:
+                continue
+            # Disk-exhaustion guard: skip open-endedly discovered repos that exceed the
+            # size cap before they are ever cloned/walked. size_kb is known up front.
+            if cand.size_kb > cap_kb:
+                logger.warning(
+                    "skipping discovered repo {} ({} KB > {} MB cap)",
+                    repo,
+                    cand.size_kb,
+                    self.max_repo_size_mb,
+                )
                 continue
             known.add(repo)
             extra.append(
@@ -438,10 +473,16 @@ class GitRepoConnector(Connector):
     def discover(self) -> Iterator[RawChallenge]:
         for seed in self.seeds:
             repo = seed["repo"]
-            local_path, sha = clone_pinned(repo, self.workdir)
-            license_info = detect_repo_license(
-                local_path, declared_spdx=seed.get("license")
-            )
+            try:
+                local_path, sha = clone_pinned(repo, self.workdir)
+                license_info = detect_repo_license(
+                    local_path, declared_spdx=seed.get("license")
+                )
+            except MirrorError as exc:
+                # A timed-out / failed clone must not abort the whole run: log and skip
+                # this repo, continuing with the rest.
+                logger.warning("skipping repo {}: {}", repo, exc)
+                continue
             for count, raw in enumerate(
                 walk_repo(local_path, seed, repo, sha, license_info=license_info), start=1
             ):

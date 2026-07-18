@@ -91,6 +91,10 @@ def ingest(
 
     if not no_materialize:
         corpus_root = data_dir / "corpus"
+        # Resolve the data dir so corpus_path is stored RELATIVE to it (e.g.
+        # 'corpus/github/...') even when --data-dir is an absolute path — an
+        # absolute machine path must never leak into the published catalog.
+        repo_root = data_dir.resolve()
         client = (
             None
             if no_fetch_writeups
@@ -103,7 +107,9 @@ def ingest(
                     if ch.corpus_path and Path(ch.corpus_path).exists()
                     else None
                 )
-                materialize_challenge(ch, corpus_root, raw_dir=raw_dir, client=client)
+                materialize_challenge(
+                    ch, corpus_root, raw_dir=raw_dir, client=client, repo_root=repo_root
+                )
         finally:
             if client is not None:
                 client.close()

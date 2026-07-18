@@ -158,11 +158,16 @@ class CTFtimeConnector(Connector):
                 ts = _iso_to_ts(event.get("start"))
                 if ts is not None:
                     max_start = max(max_start, ts)
-            # Full page → there may be more; slide the window past the last event.
-            # A short page (or a page that added nothing new) means we are done.
+            # Full page → there may be more; slide the window to (not past) the last
+            # event's start. Sliding to ``max_start`` — instead of ``max_start + 1`` —
+            # keeps events that share that boundary second but did not fit on this
+            # page: they reappear on the next page and the ``seen`` set dedupes the
+            # ones already emitted. A short page (or a page that added nothing new —
+            # e.g. every event shares one second) means we are done, so the window
+            # never advancing can never loop forever.
             if len(batch) < self.event_limit or new_in_batch == 0:
                 return
-            window_start = max_start + 1
+            window_start = max_start
 
     @staticmethod
     def _build_event(event: dict) -> CtfEvent:

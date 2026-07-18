@@ -71,9 +71,14 @@ def content_fingerprint(files: Iterable[FileEntry]) -> str | None:
     source files, join, and hash. Two challenge directories with identical source
     (regardless of extra writeups/READMEs, or file discovery order) yield the same
     fingerprint. Returns None when there are no source files (nothing to anchor on).
+
+    Every source file participates. We anchor on its ``sha256``; if that is somehow
+    missing we fall back to ``lfs_oid`` and finally to ``lfs:<size>`` so a large
+    source file is never silently dropped (which would let two challenges differing
+    only in that file collide onto one fingerprint and be wrongly merged).
     """
     entries = sorted(
-        (f.path, f.sha256) for f in files if f.is_source and f.sha256
+        (f.path, f.sha256 or f.lfs_oid or f"lfs:{f.size}") for f in files if f.is_source
     )
     if not entries:
         return None

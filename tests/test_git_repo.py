@@ -13,8 +13,13 @@ content fingerprint.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
+import pytest
+
+from ctfhoard import mirror
+from ctfhoard.connectors import git_repo
 from ctfhoard.connectors.git_repo import (
     CONNECTOR,
     GitRepoConnector,
@@ -23,6 +28,15 @@ from ctfhoard.connectors.git_repo import (
 )
 from ctfhoard.normalize import normalize
 from ctfhoard.schema import Category, LicenseInfo, Origin
+
+#: Canonical MIT opening line — enough for ``licenses.detect_from_text`` to fire.
+_MIT_TEXT = (
+    "MIT License\n\n"
+    "Copyright (c) 2024 Example\n\n"
+    "Permission is hereby granted, free of charge, to any person obtaining a copy "
+    'of this software and associated documentation files (the "Software"), to deal '
+    "in the Software without restriction.\n"
+)
 
 _SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -170,3 +184,164 @@ def test_connector_loads_and_filters_real_seeds(tmp_path: Path) -> None:
     assert len(conn.seeds) == 1
     assert conn.seeds[0]["repo"] == "google/google-ctf"
     assert conn.seeds[0]["license"] == "Apache-2.0"
+
+
+# --- [HIGH] repo ROOT is a candidate challenge leaf -------------------------
+
+
+def test_walk_single_challenge_at_root(tmp_path: Path) -> None:
+    """(Case A) A repo whose ROOT directly holds artifacts is ONE challenge, not zero.
+
+    Before the fix ``_iter_challenge_dirs`` recursed straight into the root's sub-dirs
+    and, with none present, silently emitted nothing — the whole challenge dropped.
+    """
+    root = tmp_path / "repo"
+    _write(root / "Dockerfile", "FROM ubuntu:22.04")
+    _write(root / "app.py", "print('pwn me')")
+
+    raws = list(walk_repo(root, _seed(), "acme/single-chall", _SHA))
+
+    assert len(raws) == 1
+    r = raws[0]
+    # Title derives from the repo name (relative path is empty at the root).
+    assert r.title == "single-chall"
+    assert r.local_dir == str(root)
+    assert r.source.path_in_repo in (None, "", ".")
+
+
+def test_walk_component_only_root_public_private(tmp_path: Path) -> None:
+    """(Case B) A root whose sub-dirs are ALL components is ONE challenge, not two.
+
+    Before the fix a ``public``/``private`` root emitted two bogus challenges named
+    after its parts; now it collapses to a single leaf = the root.
+    """
+    root = tmp_path / "repo"
+    _write(root / "public" / "Dockerfile", "FROM php:8")
+    _write(root / "private" / "flag.py", "FLAG = 'x'")
+
+    raws = list(walk_repo(root, _seed(), "acme/pub-priv-chall", _SHA))
+
+    titles = {r.title for r in raws}
+    assert titles == {"pub-priv-chall"}
+    assert "public" not in titles
+    assert "private" not in titles
+
+
+def test_walk_component_only_root_src_deploy(tmp_path: Path) -> None:
+    """(Case B, second layout) ``src``/``deploy`` root also collapses to one leaf."""
+    root = tmp_path / "repo"
+    _write(root / "src" / "main.c", "int main(){return 0;}")
+    _write(root / "deploy" / "Dockerfile", "FROM ubuntu:22.04")
+
+    raws = list(walk_repo(root, _seed(), "acme/src-deploy-chall", _SHA))
+
+    titles = {r.title for r in raws}
+    assert titles == {"src-deploy-chall"}
+    assert "src" not in titles
+    assert "deploy" not in titles
+
+
+def test_root_leaf_fix_preserves_multichallenge_walk(tmp_path: Path) -> None:
+    """The justCTF-style container walk still yields one leaf per challenge dir."""
+    root = tmp_path / "repo"
+    _build_fake_repo(root)
+
+    raws = list(walk_repo(root, _seed(), "sajjadium/ctf-archives", _SHA))
+
+    assert {r.title for r in raws} == {"Target Practice", "babyphp", "nested"}
+
+
+# --- [MEDIUM] git subprocess timeout ----------------------------------------
+
+
+def test_run_git_timeout_raises_mirror_error(monkeypatch) -> None:
+    """A stalled git call must surface as ``MirrorError`` (not hang / not TimeoutExpired)."""
+
+    def fake_run(*_args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=kwargs.get("timeout", 1))
+
+    monkeypatch.setattr(mirror.subprocess, "run", fake_run)
+
+    with pytest.raises(mirror.MirrorError):
+        mirror._run_git(["clone", "https://example.invalid/x", "/tmp/does-not-matter"])
+
+
+# --- [MEDIUM] discovered-repo size guard ------------------------------------
+
+
+def test_discovered_repo_over_size_cap_is_skipped(tmp_path: Path) -> None:
+    """A discovered repo bigger than the cap is never added to the walk (not cloned)."""
+    from ctfhoard.discover import RepoCandidate, write_discovered
+
+    disc = tmp_path / "discovered.jsonl"
+    write_discovered(
+        [
+            RepoCandidate(
+                full_name="fake/small-repo",
+                html_url="https://github.com/fake/small-repo",
+                size_kb=100,
+                kind="sources",
+            ),
+            RepoCandidate(
+                full_name="fake/huge-repo",
+                html_url="https://github.com/fake/huge-repo",
+                size_kb=5000,
+                kind="sources",
+            ),
+        ],
+        path=disc,
+    )
+
+    conn = GitRepoConnector(tmp_path / "work", discovered_path=disc, max_repo_size_mb=1)
+    repos = {s["repo"] for s in conn.seeds}
+
+    assert "fake/small-repo" in repos
+    assert "fake/huge-repo" not in repos
+
+
+# --- [LOW] LICENSE filename variants ----------------------------------------
+
+
+def test_detect_license_matches_filename_variant(tmp_path: Path) -> None:
+    """A ``LICENSE-MIT`` (not the exact name ``LICENSE``) is still detected as MIT."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "LICENSE-MIT").write_text(_MIT_TEXT, encoding="utf-8")
+
+    info = mirror.detect_repo_license(root, declared_spdx=None)
+
+    assert info.spdx_id == "MIT"
+    assert info.redistributable is True
+    assert info.source_file == "LICENSE-MIT"
+
+
+# --- [LOW] bounded reads of untrusted probe files ---------------------------
+
+
+def test_read_text_bounded_reads_only_prefix(tmp_path: Path) -> None:
+    """A huge probe file is read only up to the byte limit (never slurped whole)."""
+    big = tmp_path / "LICENSE"
+    big.write_text("HEAD" + "X" * 5_000_000, encoding="utf-8")
+
+    text = mirror._read_text_bounded(big, limit=4)
+
+    assert text == "HEAD"
+    assert len(text) == 4
+
+
+def test_oversized_challenge_json_is_skipped(tmp_path: Path, monkeypatch) -> None:
+    """An over-cap ``challenge.json`` is treated as absent, not parsed into memory."""
+    monkeypatch.setattr(git_repo, "_MAX_CHALLENGE_JSON_BYTES", 8)
+    root = tmp_path / "repo"
+    chal = root / "chal"
+    _write(chal / "challenge.json", json.dumps({"name": "HugeName", "flag": "flag{x}"}))
+    _write(chal / "app.py", "print(1)")
+
+    raws = list(walk_repo(root, _seed(), "some/repo", _SHA))
+
+    assert len(raws) == 1
+    r = raws[0]
+    # The oversized metadata file is skipped: title falls back to the dir name and no
+    # flag/name is lifted from the (unparsed) challenge.json.
+    assert r.title == "chal"
+    assert r.flag is None

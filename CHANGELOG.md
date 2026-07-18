@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Security & hardening (adversarial multi-agent review, 26 findings fixed)
+- **SSRF guard** (`netguard.py`): writeup fetches are validated against a public-IP
+  allowlist (reject loopback/link-local/private/reserved, IPv4-mapped IPv6),
+  redirects re-validated per hop, bodies streamed with a 25 MiB cap — closes an
+  SSRF/exfil hole where an attacker-supplied writeup URL could read cloud-metadata
+  and get published to the public dataset.
+- **No silent data loss**: Unicode-aware `slugify` + raw-title hash anchoring stops
+  non-ASCII (CJK/Cyrillic) titles from colliding into one id; `content_fingerprint`
+  now hashes large (LFS) source files so distinct challenges no longer merge.
+- **No silent drops at scale**: transient 5xx/network errors are retried+skipped
+  (not fatal) in discovery and the Hackropole/CTFtime crawls; CTFtime window
+  pagination keeps boundary-second events.
+- **Robustness**: `git clone` timeout, discovered-repo size cap, bounded reads of
+  untrusted LICENSE/challenge.json, atomic `.part` downloads, license-filename
+  variants, repo-root treated as a challenge leaf, relative `corpus_path` (no
+  absolute-path leak), writeup-orphan pruning, symlink-escape refusal.
+- 41 new regression tests (101 total).
+
 ### Added
 - Project scaffold: normalized `Challenge` schema (the data contract), connector
   interface, and the ingest → normalize → dedup → catalog pipeline.
