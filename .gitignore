@@ -19,7 +19,62 @@ gh_token*
 # Raw connector caches (re-fetchable; never committed)
 data/raw/
 data/**/.cache/
-
-# Corpus mirror is heavy: tracked via Git LFS, but keep local scratch clones out
 data/corpus/**/.git/
 data/**/*.tmp
+
+# HYBRID STORAGE MODEL:
+#   GitHub  = code + catalog + TEXT corpus (source code, writeups) — browsable index.
+#   HF      = the COMPLETE corpus incl. binaries (own2pwn-fr/ctfhoard-corpus).
+# So GitHub does NOT track heavy/binary artifacts under data/corpus/; they live on
+# HF only. `ctfhoard publish-hf` uploads the full local data/corpus/ to the dataset.
+data/corpus/**/*.bin
+data/corpus/**/*.elf
+data/corpus/**/*.exe
+data/corpus/**/*.dll
+data/corpus/**/*.so
+data/corpus/**/*.o
+data/corpus/**/*.a
+data/corpus/**/*.dylib
+data/corpus/**/*.class
+data/corpus/**/*.jar
+data/corpus/**/*.pyc
+data/corpus/**/*.zip
+data/corpus/**/*.tar
+data/corpus/**/*.tar.*
+data/corpus/**/*.tgz
+data/corpus/**/*.gz
+data/corpus/**/*.bz2
+data/corpus/**/*.xz
+data/corpus/**/*.zst
+data/corpus/**/*.7z
+data/corpus/**/*.rar
+data/corpus/**/*.pcap
+data/corpus/**/*.pcapng
+data/corpus/**/*.img
+data/corpus/**/*.iso
+data/corpus/**/*.qcow2
+data/corpus/**/*.vmdk
+data/corpus/**/*.dd
+data/corpus/**/*.raw
+data/corpus/**/*.png
+data/corpus/**/*.jpg
+data/corpus/**/*.jpeg
+data/corpus/**/*.gif
+data/corpus/**/*.bmp
+data/corpus/**/*.ico
+data/corpus/**/*.webp
+data/corpus/**/*.tiff
+data/corpus/**/*.pdf
+data/corpus/**/*.mp3
+data/corpus/**/*.wav
+data/corpus/**/*.mp4
+data/corpus/**/*.avi
+data/corpus/**/*.apk
+data/corpus/**/*.ipa
+data/corpus/**/*.dmg
+data/corpus/**/*.deb
+data/corpus/**/*.rpm
+data/corpus/**/*.sqlite
+data/corpus/**/*.db
+data/corpus/**/*.hdf5
+data/corpus/**/*.npz

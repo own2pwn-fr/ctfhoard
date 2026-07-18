@@ -13,6 +13,7 @@ from pathlib import Path
 import typer
 from loguru import logger
 
+from ctfhoard import hf
 from ctfhoard.connectors import load_registry
 from ctfhoard.corpus import materialize_challenge
 from ctfhoard.dedup import cluster_by_fingerprint, merge_cluster
@@ -143,6 +144,40 @@ def stats(data_dir: Path = typer.Option(DEFAULT_DATA, help="Root data directory.
     typer.echo("by category:")
     for cat, n in sorted(by_category.items(), key=lambda kv: -kv[1]):
         typer.echo(f"  {cat:12} {n}")
+
+
+@app.command("publish-hf")
+def publish_hf(
+    data_dir: Path = typer.Option(DEFAULT_DATA, help="Root data directory."),
+    dry_run: bool = typer.Option(
+        False, help="Report what would be uploaded without touching the network."
+    ),
+    corpus_only: bool = typer.Option(False, help="Publish only the corpus (skip catalog)."),
+    catalog_only: bool = typer.Option(False, help="Publish only the catalog (skip corpus)."),
+) -> None:
+    """Publish the local corpus and catalog to the Hugging Face dataset repo."""
+    if corpus_only and catalog_only:
+        typer.echo("--corpus-only and --catalog-only are mutually exclusive")
+        raise typer.Exit(code=1)
+
+    if not catalog_only:
+        corpus_dir = data_dir / "corpus"
+        stats = hf.corpus_stats(corpus_dir)
+        logger.info(
+            "corpus: {} files, {} bytes ({})",
+            stats["files"],
+            stats["total_bytes"],
+            hf.HF_CORPUS_DATASET,
+        )
+        result = hf.publish_corpus(corpus_dir, dry_run=dry_run)
+        logger.info("corpus publish: {}", result)
+        typer.echo(result)
+
+    if not corpus_only:
+        catalog_dir = data_dir / "catalog"
+        result = hf.publish_catalog(catalog_dir, dry_run=dry_run)
+        logger.info("catalog publish: {}", result)
+        typer.echo(result)
 
 
 if __name__ == "__main__":
