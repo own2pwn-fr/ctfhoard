@@ -21,3 +21,7 @@
   hard-copy archive (incl. binaries) is published to the Hugging Face dataset
   `own2pwn-fr/ctfhoard-corpus` via `ctfhoard publish-hf` (`hf.py`). Binaries are
   gitignored on GitHub (kept off the 1 GB free-LFS wall).
+- GitHub-wide discovery (`discover.py` + `discover-github` CLI): sharded repo
+  search with recursive `created:`/`stars:` bisection to beat the 1000-result
+  cap (verified: `topic:ctf-writeups` alone = 1819 repos), writing
+  `data/discovered_repos.jsonl` that `git_repo` ingests via `discovered_path`.
