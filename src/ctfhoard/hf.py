@@ -16,12 +16,50 @@ safe offline. The authentication token is read from the ``token`` argument or th
 from __future__ import annotations
 
 import os
+import time
 from collections import Counter
 from pathlib import Path
 
 from loguru import logger
 
 HF_CORPUS_DATASET = "own2pwn-fr/ctfhoard-corpus"
+
+#: How many times to retry a folder upload before giving up.
+_MAX_UPLOAD_ATTEMPTS = 6
+
+
+def _upload_folder_with_retry(resolved_token: str, **kwargs) -> str:
+    """``HfApi.upload_folder`` with retry on transient network failures.
+
+    Large uploads occasionally hit a connection reset (``Connection reset by peer``)
+    that leaves huggingface_hub's underlying client closed, so a bare call dies with
+    "Cannot send a request, as the client has been closed". ``upload_folder`` is
+    incremental — it diffs against the remote and only sends missing files — so we
+    retry with a FRESH ``HfApi`` each attempt; successive tries resume where the last
+    left off and converge. Only a persistent failure (all attempts exhausted) raises.
+    """
+    from huggingface_hub import HfApi
+
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_UPLOAD_ATTEMPTS + 1):
+        try:
+            api = HfApi(token=resolved_token)  # fresh client per attempt
+            return str(api.upload_folder(**kwargs))
+        except Exception as exc:  # noqa: BLE001 — retry any transient upload failure
+            last_exc = exc
+            if attempt == _MAX_UPLOAD_ATTEMPTS:
+                break
+            wait = min(60.0, 2.0**attempt)
+            logger.warning(
+                "HF upload attempt {}/{} failed ({}); retrying in {}s",
+                attempt,
+                _MAX_UPLOAD_ATTEMPTS,
+                exc,
+                wait,
+            )
+            time.sleep(wait)
+    assert last_exc is not None
+    raise last_exc
 
 
 class HFTokenError(RuntimeError):
@@ -107,10 +145,8 @@ def publish_corpus(
         return report
 
     resolved_token = _resolve_token(token)
-    from huggingface_hub import HfApi
-
-    api = HfApi(token=resolved_token)
-    commit_url = api.upload_folder(
+    commit_url = _upload_folder_with_retry(
+        resolved_token,
         repo_id=dataset,
         repo_type="dataset",
         folder_path=str(corpus_dir),
@@ -153,10 +189,8 @@ def publish_catalog(
         return report
 
     resolved_token = _resolve_token(token)
-    from huggingface_hub import HfApi
-
-    api = HfApi(token=resolved_token)
-    commit_url = api.upload_folder(
+    commit_url = _upload_folder_with_retry(
+        resolved_token,
         repo_id=dataset,
         repo_type="dataset",
         folder_path=str(catalog_dir),
