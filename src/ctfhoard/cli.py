@@ -241,17 +241,26 @@ def mirror(
     max_repo_size_mb: int = typer.Option(
         4096, help="Cap (MB) on a discovered repo's size before cloning."
     ),
+    batch_size: int = typer.Option(
+        50, help="Publish once per this many staged repos (batches HF commits)."
+    ),
+    batch_max_mb: int = typer.Option(
+        15000, help="Also flush a batch once its staging tree reaches this many MB."
+    ),
     resume: bool = typer.Option(True, help="Skip repos already recorded 'ok' in the manifest."),
     token: str = typer.Option(
         None, help="Hugging Face token; defaults to the HF_TOKEN environment variable."
     ),
 ) -> None:
-    """Stream-mirror many repos to the HF dataset, one repo at a time.
+    """Commit-batched mirror of many repos to the HF dataset, disk-bounded.
 
-    For each repo: clone → normalize → dedup → materialize hard copies → publish that
-    repo's corpus subtree + catalog shard to HF → delete the raw clone (and staging,
-    unless --keep-local). Peak local disk stays bounded to roughly one repo. Resumable
-    via ``data_dir/mirror_state.jsonl``.
+    Repos are staged into a shared batch (clone → normalize → dedup → materialize hard
+    copies → delete the raw clone); once the batch reaches --batch-size repos or
+    --batch-max-mb on disk, the WHOLE batch is published in one corpus + one catalog
+    commit, then the staging tree is cleaned (unless --keep-local). This cuts HF commit
+    count ~50× (avoiding rate limits) while peak local disk stays bounded to one batch.
+    Resumable via ``data_dir/mirror_state.jsonl`` — a repo is 'ok' only after its batch
+    is published.
     """
     from ctfhoard import pipeline
 
@@ -276,6 +285,8 @@ def mirror(
         max_repo_size_mb=max_repo_size_mb,
         token=token,
         resume=resume,
+        batch_size=batch_size,
+        batch_max_mb=batch_max_mb,
     )
 
     by_status: dict[str, int] = {}
@@ -287,7 +298,7 @@ def mirror(
 
     typer.echo("mirror summary:")
     typer.echo(f"  processed:   {len(results)}")
-    for status in ("ok", "failed", "skipped", "too_big"):
+    for status in ("ok", "failed", "skipped", "too_big", "staged"):
         if by_status.get(status):
             typer.echo(f"  {status:10} {by_status[status]}")
     typer.echo(f"  challenges:  {total_challenges}")

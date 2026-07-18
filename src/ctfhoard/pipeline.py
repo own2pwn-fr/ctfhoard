@@ -1,22 +1,31 @@
-"""Disk-bounded streaming mirror of many repos to the Hugging Face dataset.
+"""Disk-bounded, commit-batched mirror of many repos to the Hugging Face dataset.
 
 The plain ``ingest`` command clones every seed repo, materializes the *whole* corpus
 on disk, then publishes it in one shot — which needs enough local disk to hold all
-repos at once. This module streams instead: it processes ONE repo end-to-end
-(clone → normalize → dedup → materialize → publish that repo's corpus subtree +
-catalog shard to HF), then deletes that repo's raw clone and corpus staging before
-moving to the next. Peak local disk stays bounded to roughly a single repo, so the
-mirror scales to the whole long tail of CTF repositories.
+repos at once. Publishing one repo at a time bounds disk but pays TWO HF commits per
+repo; at the scale of thousands of repos Hugging Face rate-limits commits (HTTP 429 →
+multi-minute back-offs) and the marathon stretches into weeks.
+
+This module keeps disk bounded *and* cuts commit count ~50× by batching. It stages
+MANY repos into ONE shared staging tree (``data_dir/staging_batch``): each repo is
+cloned, walked, normalized, dedup'd and materialized into the shared
+``staging_batch/corpus`` tree, its raw clone is deleted immediately (the materialized
+copy is smaller), and its catalog shard is written under ``staging_batch/catalog``.
+Once the batch reaches ``batch_size`` repos or ``batch_max_mb`` on disk, the *whole*
+batch is published in a single corpus commit + a single catalog commit, then the
+staging tree is deleted before the next batch starts. Peak local disk stays bounded to
+one batch, and HF sees two commits per batch instead of two per repo.
 
 Two invariants make this safe and resumable:
 
-* **Isolation** — each repo materializes into its own ``staging/<slug>/corpus`` tree
-  whose layout (``corpus/<origin>/<event>/<year>/<slug>__id``) matches the HF dataset
-  exactly, so :meth:`huggingface_hub.HfApi.upload_folder` only diffs/sends new files
-  while the local bytes remain in a single deletable directory.
-* **Durability** — a resume manifest (``mirror_state.jsonl``) records each completed
-  repo the moment it finishes, so a crash mid-run resumes from where it stopped and
-  never re-publishes a repo already marked ``ok``.
+* **Isolation** — the shared staging tree's layout
+  (``corpus/<origin>/<event>/<year>/<slug>__id``) matches the HF dataset exactly, so
+  :meth:`huggingface_hub.HfApi.upload_folder` only diffs/sends new files while the
+  local bytes remain in a single deletable directory.
+* **Durability** — a resume manifest (``mirror_state.jsonl``) records each repo as
+  ``ok`` ONLY after the batch it belongs to has been published to HF. A crash mid-batch
+  (before the flush) leaves those repos un-``ok``, so the next run simply re-does them —
+  never a silent gap, never a double publish of an already-``ok`` repo.
 
 Every per-repo body is wrapped so a clone timeout, walk error, or publish failure is
 recorded as a failed :class:`RepoResult` and NEVER aborts the surrounding loop.
@@ -54,17 +63,19 @@ _SEED_SECTIONS = ("official_sources", "community_archives", "writeup_archives")
 #: Repo-root ``seeds/official_repos.yaml`` (pipeline.py -> ctfhoard -> src -> root).
 _DEFAULT_SEEDS = Path(__file__).resolve().parents[2] / "seeds" / "official_repos.yaml"
 
-Status = Literal["ok", "failed", "skipped", "too_big"]
+Status = Literal["ok", "failed", "skipped", "too_big", "staged"]
 
 
 class RepoResult(BaseModel):
     """Outcome of mirroring a single repo (one manifest/summary row).
 
-    ``status`` is ``ok`` when the repo was cloned, materialized and (optionally)
-    published; ``skipped`` when the disk-guard floor was hit before cloning;
-    ``too_big`` when the repo's known size exceeds the size cap; ``failed`` when any
-    step raised (the error is captured, the loop continues). ``n_files``/``bytes``
-    describe the materialized corpus subtree that was (or would be) published.
+    ``status`` is ``staged`` when the repo was cloned and materialized into the current
+    batch but not yet published; it becomes ``ok`` once that batch is committed to HF,
+    or ``failed`` if the batch publish fails (the repo re-clones next run). ``skipped``
+    means the disk-guard floor was hit before cloning; ``too_big`` means the repo's
+    known size exceeds the size cap; ``failed`` also covers any step that raised while
+    staging (the error is captured, the loop continues). ``n_files``/``bytes`` describe
+    the materialized corpus subtree this repo contributed to the batch.
     """
 
     repo: str = Field(description="'owner/name' identifier on GitHub.")
@@ -123,35 +134,39 @@ def _discovered_size_kb(data_dir: Path, repo: str) -> int | None:
     return None
 
 
-def mirror_repo(
+def stage_repo(
     repo: str,
     *,
     data_dir: Path,
-    dataset: str,
-    publish: bool,
-    keep_local: bool,
+    batch_corpus_root: Path,
+    batch_catalog_root: Path,
     max_repo_size_mb: int,
     token: str | None,
+    discovered_path: Path | None = None,
 ) -> RepoResult:
-    """Mirror one repo end-to-end, keeping local disk bounded to this repo alone.
+    """Clone one repo and materialize it INTO the current shared batch (no publish).
 
     Clones ``repo`` under ``data_dir/raw``, walks/normalizes/dedups it, materializes
-    hard copies into an isolated per-repo ``staging/<slug>/corpus`` tree (whose layout
-    matches the HF dataset), writes the small catalog shard under ``catalog/<slug>``,
-    optionally publishes the corpus subtree + shard to ``dataset``, then ALWAYS deletes
-    the raw clone (and, unless ``keep_local``, the staging tree) — even on failure — so
-    the next repo starts from a clean, bounded disk. Never raises: any error becomes a
-    ``failed`` :class:`RepoResult` so the caller's loop continues.
+    hard copies into the SHARED ``batch_corpus_root`` (whose layout matches the HF
+    dataset), writes the repo's catalog shard under ``batch_catalog_root/<slug>``, then
+    ALWAYS deletes the raw clone — even on failure — so disk stays bounded to the
+    materialized batch alone. It does NOT publish and does NOT touch the shared batch
+    staging (the caller flushes the whole batch later).
+
+    Never raises: a clone timeout, walk error or any other exception becomes a
+    ``failed`` :class:`RepoResult` so the caller's loop continues. A successful stage
+    returns status ``staged`` (materialized-into-batch, not yet published); the
+    disk-guard floor yields ``skipped`` and the size cap yields ``too_big``, both
+    before any clone.
     """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    batch_corpus_root = Path(batch_corpus_root)
+    batch_catalog_root = Path(batch_catalog_root)
 
     slug = _repo_dirname(repo)
     raw_workdir = data_dir / "raw"
     clone_dir = raw_workdir / slug
-    staging_dir = data_dir / "staging" / slug
-    corpus_root = staging_dir / "corpus"
-    catalog_dir = data_dir / "catalog" / slug
 
     # Disk guard: refuse to start a clone that could exhaust the disk mid-run.
     free = shutil.disk_usage(data_dir).free
@@ -179,12 +194,16 @@ def mirror_repo(
         # A discovered repo is not in the curated seeds, so let the connector treat the
         # discovered-repo list as extra seeds when it exists (harmless for seed repos:
         # the ``only`` filter + known-repo dedup keep the walk to exactly this repo).
-        disc = data_dir / "discovered_repos.jsonl"
+        disc = (
+            discovered_path
+            if discovered_path is not None and Path(discovered_path).exists()
+            else None
+        )
         connector = GitRepoConnector(
             workdir=raw_workdir,
             only=[repo],
             max_repo_size_mb=max_repo_size_mb,
-            discovered_path=disc if disc.exists() else None,
+            discovered_path=disc,
         )
 
         # Clone → walk → normalize → dedup.
@@ -192,10 +211,15 @@ def mirror_repo(
         challenges = _dedup(challenges)
         commit_sha = _commit_sha_of(challenges)
 
-        # Materialize each challenge into the isolated per-repo staging corpus. Using
-        # repo_root=staging makes corpus_path come out as 'corpus/<origin>/...', the
-        # exact HF layout, while the bytes stay under a single deletable directory.
-        repo_root = staging_dir.resolve()
+        # Measure the batch corpus before/after so this repo's own file/byte
+        # contribution can be reported (the batch tree is shared and accumulates).
+        before = hf.corpus_stats(batch_corpus_root)
+
+        # Materialize each challenge into the SHARED batch corpus. Using
+        # repo_root=batch_corpus_root.parent (= staging_batch) makes corpus_path come
+        # out as 'corpus/<origin>/...', the exact HF layout, while all batch bytes stay
+        # under one deletable directory.
+        repo_root = batch_corpus_root.parent.resolve()
         for ch in challenges:
             raw_dir = (
                 Path(ch.corpus_path)
@@ -205,32 +229,26 @@ def mirror_repo(
             # client=None: repo writeups are in-repo files copied with the sources; no
             # external link is followed here.
             materialize_challenge(
-                ch, corpus_root, raw_dir=raw_dir, client=None, repo_root=repo_root
+                ch, batch_corpus_root, raw_dir=raw_dir, client=None, repo_root=repo_root
             )
 
-        # Write the (small, KEPT) catalog shard for this repo.
-        writer = CatalogWriter(catalog_dir)
+        after = hf.corpus_stats(batch_corpus_root)
+
+        # Write this repo's catalog shard into the shared batch catalog tree.
+        writer = CatalogWriter(batch_catalog_root / slug)
         writer.extend(challenges)
         writer.write_jsonl()
-
-        stats = hf.corpus_stats(corpus_root)
-
-        if publish:
-            hf.publish_corpus(
-                corpus_root, dataset=dataset, path_in_repo="corpus", token=token
-            )
-            hf.publish_catalog(catalog_dir, dataset=dataset, token=token)
 
         return RepoResult(
             repo=repo,
             commit_sha=commit_sha,
             n_challenges=len(challenges),
-            n_files=stats["files"],
-            bytes=stats["total_bytes"],
-            status="ok",
+            n_files=after["files"] - before["files"],
+            bytes=after["total_bytes"] - before["total_bytes"],
+            status="staged",
         )
     except Exception as exc:  # noqa: BLE001 — one bad repo must never abort the run
-        logger.warning("mirror_repo {} failed: {}", repo, exc)
+        logger.warning("stage_repo {} failed: {}", repo, exc)
         return RepoResult(
             repo=repo,
             commit_sha=commit_sha,
@@ -238,11 +256,10 @@ def mirror_repo(
             error=f"{type(exc).__name__}: {exc}",
         )
     finally:
-        # ALWAYS free the raw clone; drop the staging corpus unless the caller keeps it.
-        # A mid-repo failure still reclaims disk here before the next repo runs.
+        # ALWAYS free the raw clone immediately: the materialized copy in the batch is
+        # smaller, so dropping the clone keeps peak disk bounded to one batch. The
+        # shared batch staging is NEVER touched here — the caller flushes it.
         shutil.rmtree(clone_dir, ignore_errors=True)
-        if not keep_local:
-            shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _load_done_ok(manifest: Path) -> set[str]:
@@ -285,6 +302,82 @@ def _append_manifest(manifest: Path, result: RepoResult, *, ts: datetime) -> Non
         fh.flush()
 
 
+def _flush_batch(
+    batch_staged: list[RepoResult],
+    *,
+    data_dir: Path,
+    dataset: str,
+    publish: bool,
+    keep_local: bool,
+    token: str | None,
+    batch_corpus_root: Path,
+    batch_catalog_root: Path,
+    manifest: Path,
+) -> list[RepoResult]:
+    """Publish one accumulated batch in a single corpus + catalog commit, then finalize.
+
+    ``batch_staged`` holds the repos materialized into the shared staging tree since the
+    last flush. When ``publish`` is set and the batch corpus is non-empty, the WHOLE
+    batch is uploaded as ONE corpus commit + ONE catalog commit (this is the ~50×
+    commit-count reduction versus per-repo publishing).
+
+    * On success (or ``publish=False``): every staged repo is recorded ``ok`` in the
+      manifest — this is the ONLY place a repo becomes ``ok``, so a repo is durably done
+      strictly *after* its bytes reached HF.
+    * On publish failure: every staged repo is recorded ``failed`` so the next run
+      re-clones and re-stages it.
+
+    The shared staging tree is deleted afterwards — always on failure (bytes will be
+    re-cloned) and on success unless ``keep_local`` — so peak disk stays bounded to one
+    batch. Returns the finalized results (with updated status). A no-op on an empty batch.
+    """
+    if not batch_staged:
+        return []
+
+    staging_batch = Path(data_dir) / "staging_batch"
+    stats = hf.corpus_stats(batch_corpus_root)
+
+    published_ok = True
+    commit_url: str | None = None
+    if publish and stats["files"] > 0:
+        try:
+            commit_url = hf.publish_corpus(
+                batch_corpus_root, dataset=dataset, path_in_repo="corpus", token=token
+            )
+            hf.publish_catalog(batch_catalog_root, dataset=dataset, token=token)
+        except Exception as exc:  # noqa: BLE001 — a failed batch retries next run
+            logger.warning(
+                "flush publish failed ({}): {} repo(s) will re-stage next run",
+                exc,
+                len(batch_staged),
+            )
+            published_ok = False
+
+    # Finalize: 'ok' only once the batch is on HF; 'failed' means redo next run.
+    ts = datetime.now(UTC)
+    finalized: list[RepoResult] = []
+    for r in batch_staged:
+        r.status = "ok" if published_ok else "failed"
+        if not published_ok:
+            r.error = "batch publish failed; re-clones next run"
+        _append_manifest(manifest, r, ts=ts)
+        finalized.append(r)
+
+    # Reclaim the shared staging tree: always when the publish failed (they re-clone),
+    # and on success unless the caller keeps local bytes for inspection.
+    if not published_ok or not keep_local:
+        shutil.rmtree(staging_batch, ignore_errors=True)
+
+    logger.info(
+        "flush: published {} repos, {} files/{:.1f} MB, {}",
+        len(finalized),
+        stats["files"],
+        stats["total_bytes"] / 1024**2,
+        commit_url or ("skipped (empty batch)" if publish else "publish disabled"),
+    )
+    return finalized
+
+
 def mirror_all(
     repos: list[str],
     *,
@@ -295,43 +388,78 @@ def mirror_all(
     max_repo_size_mb: int,
     token: str | None,
     resume: bool,
+    batch_size: int = 50,
+    batch_max_mb: int = 15000,
 ) -> list[RepoResult]:
-    """Mirror many repos one at a time, streaming and resumable.
+    """Mirror many repos in commit-batches, disk-bounded and resumable.
 
     Loads the resume manifest at ``data_dir/mirror_state.jsonl``; when ``resume`` is set,
-    repos already recorded ``ok`` are skipped. Each repo is mirrored by :func:`mirror_repo`
-    (which bounds local disk to one repo) and its result appended to the manifest the
-    moment it completes, so a crash resumes cleanly. Returns every result (including
-    skips of already-done repos are NOT re-emitted — only repos actually processed here).
+    repos already recorded ``ok`` are skipped. Each remaining repo is staged into a
+    shared batch by :func:`stage_repo`; once the batch reaches ``batch_size`` staged
+    repos OR ``batch_max_mb`` MB on disk, :func:`_flush_batch` publishes the whole batch
+    in one corpus + one catalog commit and marks its repos ``ok``. Any remaining staged
+    repos are flushed at the end.
+
+    Resume correctness: a repo is recorded ``ok`` ONLY after its batch is published to
+    HF. If the process dies mid-batch (before a flush), those repos are never ``ok`` and
+    get redone next run — no gaps, no double publishing. Non-staged outcomes
+    (``failed``/``skipped``/``too_big``) are recorded as-is immediately. Returns every
+    result actually processed here (already-``ok`` skips are not re-emitted).
     """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     manifest = data_dir / "mirror_state.jsonl"
 
+    staging_batch = data_dir / "staging_batch"
+    batch_corpus_root = staging_batch / "corpus"
+    batch_catalog_root = staging_batch / "catalog"
+    discovered_path = data_dir / "discovered_repos.jsonl"
+
+    # A leftover staging tree from a crashed run is UNPUBLISHED (its repos are not 'ok'):
+    # drop it so the first batch starts clean; those repos are re-staged from scratch.
+    shutil.rmtree(staging_batch, ignore_errors=True)
+
     done_ok = _load_done_ok(manifest) if resume else set()
     results: list[RepoResult] = []
+    batch_staged: list[RepoResult] = []
+    batch_bytes = 0
     total = len(repos)
+
+    def _flush() -> None:
+        nonlocal batch_staged, batch_bytes
+        finalized = _flush_batch(
+            batch_staged,
+            data_dir=data_dir,
+            dataset=dataset,
+            publish=publish,
+            keep_local=keep_local,
+            token=token,
+            batch_corpus_root=batch_corpus_root,
+            batch_catalog_root=batch_catalog_root,
+            manifest=manifest,
+        )
+        results.extend(finalized)
+        batch_staged = []
+        batch_bytes = 0
 
     for i, repo in enumerate(repos, start=1):
         if resume and repo in done_ok:
             logger.info("[{}/{}] {} → skip (already ok)", i, total, repo)
             continue
 
-        result = mirror_repo(
+        result = stage_repo(
             repo,
             data_dir=data_dir,
-            dataset=dataset,
-            publish=publish,
-            keep_local=keep_local,
+            batch_corpus_root=batch_corpus_root,
+            batch_catalog_root=batch_catalog_root,
             max_repo_size_mb=max_repo_size_mb,
             token=token,
+            discovered_path=discovered_path,
         )
-        results.append(result)
-        _append_manifest(manifest, result, ts=datetime.now(UTC))
 
         free = shutil.disk_usage(data_dir).free
         logger.info(
-            "[{}/{}] {} → {} ({} challenges, {:.1f} MB, free disk {:.1f} GB)",
+            "[{}/{}] {} → {} ({} ch, {:.1f} MB, free disk {:.1f} GB)",
             i,
             total,
             repo,
@@ -341,6 +469,18 @@ def mirror_all(
             free / 1024**3,
         )
 
+        if result.status == "staged":
+            batch_staged.append(result)
+            batch_bytes += result.bytes
+            if len(batch_staged) >= batch_size or batch_bytes >= batch_max_mb * 1024**2:
+                _flush()
+        else:
+            # failed / skipped / too_big are terminal for this run: record as-is now.
+            _append_manifest(manifest, result, ts=datetime.now(UTC))
+            results.append(result)
+
+    # Final flush of any repos staged since the last flush.
+    _flush()
     return results
 
 

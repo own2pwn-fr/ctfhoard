@@ -36,3 +36,8 @@ data/corpus/
 data/discovered_repos.jsonl
 data/mirror_state.jsonl
 data/staging/
+
+# Per-repo catalog shards are published to HF during the marathon (dataset is
+# self-describing). GitHub gets periodic consolidated catalog snapshots instead of
+# thousands of live per-repo commits.
+data/catalog/
