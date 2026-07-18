@@ -1,0 +1,50 @@
+[project]
+name = "ctfhoard"
+version = "0.1.0"
+description = "Aggregate all whitebox CTF challenge sources and writeups into one normalized, provenance-tracked corpus."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "own2pwn", email = "contact@own2pwn.fr" }]
+keywords = ["ctf", "security", "writeups", "dataset", "corpus", "archive"]
+
+dependencies = [
+    "pydantic>=2.7",
+    "httpx>=0.27",
+    "selectolax>=0.3.21",   # fast HTML parsing (Hackropole / CTFtime pages)
+    "pyyaml>=6.0",          # Juice Shop challenges.yml, seed configs
+    "typer>=0.12",          # CLI
+    "loguru>=0.7",          # logging
+    "tenacity>=8.2",        # retry/backoff around HTTP + git
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=16.0"]
+bigquery = ["google-cloud-bigquery>=3.20", "db-dtypes>=1.2"]
+dedup = ["datasketch>=1.6"]  # MinHash near-dup detection
+dev = ["pytest>=8.0", "pytest-httpx>=0.30", "ruff>=0.5", "mypy>=1.10"]
+
+[project.scripts]
+ctfhoard = "ctfhoard.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ctfhoard"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer's idiom puts Option()/Argument() calls in argument defaults.
+"src/ctfhoard/cli.py" = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

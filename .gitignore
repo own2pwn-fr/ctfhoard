@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Secrets / credentials
+.env
+*.pem
+*-service-account*.json
+gh_token*
+
+# Raw connector caches (re-fetchable; never committed)
+data/raw/
+data/**/.cache/
+
+# Corpus mirror is heavy: tracked via Git LFS, but keep local scratch clones out
+data/corpus/**/.git/
+data/**/*.tmp
