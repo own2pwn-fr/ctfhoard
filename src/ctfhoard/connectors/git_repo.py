@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,7 +45,7 @@ from loguru import logger
 
 from ctfhoard.connectors.base import Connector
 from ctfhoard.mirror import MirrorError, clone_pinned, detect_repo_license
-from ctfhoard.normalize import map_category
+from ctfhoard.normalize import _CATEGORY_MAP, map_category
 from ctfhoard.schema import Category, LicenseInfo, Origin, RawChallenge, Source
 
 #: Upper bound on bytes read from an untrusted ``challenge.json``. A repo can ship a
@@ -114,6 +115,38 @@ _COMPONENT_NAMES = frozenset(
         "uploads",
         "release",
         "docker",
+        # kCTF / Google-CTF style challenge layout: the real challenge dir wraps its
+        # parts in these sub-dirs (the ``challenge`` payload, the ``healthcheck`` prober,
+        # the player ``attachments``, the ``solution``, ``metadata``). Treat them as parts
+        # so the PARENT is emitted as one challenge instead of each part becoming a fake
+        # one. Deliberately conservative: generic words that are just as often *category
+        # container* names (``web``, ``app``, ``bot``, ``chal``) are NOT listed here — a
+        # ``.../web/<challenge>`` container must still recurse, not collapse.
+        "challenge",
+        "healthcheck",
+        "health-check",
+        "metadata",
+        "sample",
+        "samples",
+        "sol",
+        "sols",
+        "resources",
+        "static",
+    }
+)
+
+#: The strongest "this dir is a challenge *part*, so my parent is the challenge" signals.
+#: The mere *presence* of one of these sub-dirs pins the parent as a single challenge
+#: root even when it also has oddly-named source sub-dirs (``frontend``, ``pcb``,
+#: ``warrior`` …), which would otherwise fragment the challenge into its parts.
+_ROOT_MARKER_NAMES = frozenset(
+    {
+        "attachments",
+        "challenge",
+        "healthcheck",
+        "health-check",
+        "solution",
+        "solutions",
     }
 )
 
@@ -134,11 +167,50 @@ _NOISE_DIRS = frozenset(
         ".venv",
         ".pytest_cache",
         ".ruff_cache",
+        # Vendored / scaffolding trees that hold *no challenge of their own*: descending
+        # into them fragments a huge dependency checkout (edk2, cpython, PEGTL …) or the
+        # kCTF framework into thousands of bogus, uncategorizable "challenges".
+        "third_party",
+        "third-party",
+        "thirdparty",
+        "vendor",
+        "vendored",
+        "kctf",
     }
 )
 
 #: Path segments that denote an edition rather than an event/category/challenge.
 _EDITION_TOKENS = frozenset({"quals", "qualifiers", "finals", "final", "onsite"})
+
+#: Whole-token category vocabulary for parsing a category out of a challenge dir NAME.
+#: Derived from the normalize map so the two stay in sync, keeping only single-word keys
+#: — a multi-word label like "binary exploitation" never appears as one hyphen/underscore
+#: token. Values are canonical labels that :func:`map_category` resolves, so the derived
+#: ``raw_category`` still normalizes correctly. A couple of common abbreviations the
+#: substring-based map cannot resolve on their own are added explicitly: ``re`` (Google's
+#: reverse-engineering prefix) and ``hw`` (hardware).
+_NAME_CATEGORY_TOKENS: dict[str, str] = {key: key for key in _CATEGORY_MAP if " " not in key}
+_NAME_CATEGORY_TOKENS.update({"re": "reverse", "hw": "hardware"})
+
+#: Split a challenge dir name into its lower-cased tokens (hyphen/underscore/space).
+_NAME_TOKEN_RE = re.compile(r"[-_\s]+")
+
+
+def _category_from_name(name: str) -> str | None:
+    """Derive a raw category label from a challenge directory NAME, else ``None``.
+
+    Google-CTF and many flat archives encode the category as a token in the dir name
+    (``2017-finals-crypto-bender`` -> crypto, ``pwn-hyperion`` -> pwn, ``re-corewars`` ->
+    reverse, ``hw-parking`` -> hardware). We split on ``-``/``_``/space and match WHOLE
+    tokens against :data:`_NAME_CATEGORY_TOKENS` — never a naive substring, so ``web``
+    inside ``webhook`` cannot false-match while the short ``re``/``hw`` tokens still do.
+    The first matching token wins: these layouts put the category prefix at the front.
+    """
+    for token in _NAME_TOKEN_RE.split(name.lower()):
+        label = _NAME_CATEGORY_TOKENS.get(token)
+        if label is not None:
+            return label
+    return None
 
 #: owner (lowercased) / repo-specific -> a more precise Origin than plain GITHUB.
 _ORIGIN_BY_REPO: dict[str, Origin] = {
@@ -204,6 +276,23 @@ def _all_subdirs_are_components(subdirs: list[Path]) -> bool:
     return bool(subdirs) and all(d.name.lower() in _COMPONENT_NAMES for d in subdirs)
 
 
+def _is_challenge_root(subdirs: list[Path]) -> bool:
+    """True if ``subdirs`` mark their parent as a single challenge root (not a container).
+
+    Two signals collapse a directory to one challenge instead of fragmenting it into its
+    parts:
+
+    * every sub-dir is a component (justCTF/pwn.college ``public``+``private`` style), or
+    * at least one sub-dir is a *strong* root marker (``challenge``/``attachments``/
+      ``healthcheck``/``solution``). Its presence pins the parent as the challenge even
+      when the parent also has oddly-named source sub-dirs (``frontend``, ``pcb`` …) that
+      would otherwise be mistaken for separate challenges — the kCTF/Google-CTF layout.
+    """
+    return _all_subdirs_are_components(subdirs) or any(
+        d.name.lower() in _ROOT_MARKER_NAMES for d in subdirs
+    )
+
+
 def _iter_challenge_dirs(root: Path) -> Iterator[Path]:
     """Yield every challenge directory beneath ``root`` (see module docstring).
 
@@ -232,10 +321,11 @@ def _collect_challenge_dirs(d: Path) -> Iterator[Path]:
         yield d
         return
     subdirs = sorted(p for p in d.iterdir() if p.is_dir() and not _is_noise(p.name))
-    # Component-only layout: every sub-dir is a challenge *part* (public/private/…),
-    # so this dir is the challenge root even with nothing at its own top level
-    # (justCTF/pwn.college style). Stop here rather than fragmenting into components.
-    if _all_subdirs_are_components(subdirs) and _subtree_has_artifacts(d):
+    # Component/challenge-root layout: the sub-dirs are challenge *parts* (public/private,
+    # or a kCTF challenge/attachments/healthcheck/solution wrapper), so this dir is the
+    # challenge root even with nothing at its own top level. Stop here rather than
+    # fragmenting into components (and never emitting a leaf titled ``challenge`` etc.).
+    if _is_challenge_root(subdirs) and _subtree_has_artifacts(d):
         yield d
         return
     # Otherwise a container (event/year/category, or the repo root) — recurse toward
@@ -299,12 +389,12 @@ def _derive_meta(
     raw_category = cj.get("category")
     if raw_category is None and category_idx is not None:
         raw_category = ancestors[category_idx]
-    # Last resort: many flat archives encode the category as a prefix on the challenge
-    # dir name (e.g. ``pwn_baby_otter`` -> pwn, ``web_mongodb`` -> web).
-    if raw_category is None and "_" in title:
-        prefix = title.split("_", 1)[0]
-        if map_category(prefix) is not Category.UNKNOWN:
-            raw_category = prefix
+    # Last resort: many archives encode the category in the challenge dir NAME rather than
+    # as a clean ancestor segment (Google-CTF ``2017-finals-crypto-bender`` -> crypto,
+    # ``pwn-hyperion`` -> pwn, ``re-corewars`` -> reverse; flat ``web_mongodb`` -> web).
+    # Only consult the name when no ancestor segment supplied a category.
+    if raw_category is None and segments:
+        raw_category = _category_from_name(segments[-1])
 
     # Structural wrapper segments (CTFs/, challenges/) are never the event name.
     consumed = {year_idx, edition_idx, category_idx}
