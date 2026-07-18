@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 parquet = ["pyarrow>=16.0"]
+hf = ["huggingface_hub>=0.24"]  # `ctfhoard publish-hf` → own2pwn-fr/ctfhoard-corpus
 bigquery = ["google-cloud-bigquery>=3.20", "db-dtypes>=1.2"]
 dedup = ["datasketch>=1.6"]  # MinHash near-dup detection
 dev = ["pytest>=8.0", "pytest-httpx>=0.30", "ruff>=0.5", "mypy>=1.10"]
