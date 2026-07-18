@@ -26,7 +26,7 @@ from ctfhoard.connectors.git_repo import (
     _origin_for_repo,
     walk_repo,
 )
-from ctfhoard.normalize import normalize
+from ctfhoard.normalize import map_category, normalize
 from ctfhoard.schema import Category, LicenseInfo, Origin
 
 #: Canonical MIT opening line — enough for ``licenses.detect_from_text`` to fire.
@@ -249,6 +249,76 @@ def test_root_leaf_fix_preserves_multichallenge_walk(tmp_path: Path) -> None:
     raws = list(walk_repo(root, _seed(), "sajjadium/ctf-archives", _SHA))
 
     assert {r.title for r in raws} == {"Target Practice", "babyphp", "nested"}
+
+
+# --- category derived from the challenge DIRECTORY NAME ----------------------
+
+
+def test_category_derived_from_challenge_dir_name(tmp_path: Path) -> None:
+    """Google-CTF encodes the category as a token in the dir NAME, not a clean segment.
+
+    ``2017-finals-crypto-bender`` / ``pwn-heat`` / ``re-arcade`` / ``rev-polymorph``
+    carry no ancestor path segment that maps to a category, so before the fix they all
+    fell through to UNKNOWN. The name is now scanned for a WHOLE-token category keyword
+    (``re``/``rev`` for reverse too), and the derived ``raw_category`` normalizes.
+    """
+    root = tmp_path / "repo"
+    # No ancestor segment maps to a category -> the name is the only signal.
+    _write(root / "2017" / "finals" / "2017-finals-crypto-bender" / "bender.py", "x = 1")
+    _write(root / "2024" / "quals" / "pwn-heat" / "Dockerfile", "FROM ubuntu:22.04")
+    _write(root / "2024" / "quals" / "re-arcade" / "arcade.c", "int main(){return 0;}")
+    _write(root / "2021" / "quals" / "rev-polymorph" / "poly.py", "print(1)")
+    # Whole-token guard: ``web`` must NOT match inside ``webhook``.
+    _write(root / "2024" / "quals" / "webhook-abuse" / "note.py", "pass")
+
+    raws = list(walk_repo(root, _seed(), "google/google-ctf", _SHA))
+    by = {r.title: r for r in raws}
+
+    bender = by["2017-finals-crypto-bender"]
+    assert bender.raw_category is not None
+    assert map_category(bender.raw_category) is Category.CRYPTO
+    assert normalize(bender).category is Category.CRYPTO
+    assert bender.year == 2017
+    assert bender.edition == "finals"
+
+    assert map_category(by["pwn-heat"].raw_category) is Category.PWN
+    assert normalize(by["pwn-heat"]).category is Category.PWN
+    # ``re`` and ``rev`` are both recognized as WHOLE tokens for reverse.
+    assert normalize(by["re-arcade"]).category is Category.REVERSE
+    assert normalize(by["rev-polymorph"]).category is Category.REVERSE
+
+    # ``webhook`` is not a bare ``web`` token, so no false crypto/web hit.
+    assert by["webhook-abuse"].raw_category is None
+    assert normalize(by["webhook-abuse"]).category is Category.UNKNOWN
+
+
+def test_kctf_component_wrapper_collapses_to_one_challenge(tmp_path: Path) -> None:
+    """A kCTF challenge dir wrapping {attachments, challenge, healthcheck} is ONE leaf.
+
+    The 2024 Google-CTF layout fragmented into bogus leaves literally titled
+    ``attachments`` / ``challenge`` / ``healthcheck`` (their component sub-dirs). The
+    presence of such a strong root-marker sub-dir now pins the PARENT as the single
+    challenge, and no component sub-dir is ever emitted as a challenge on its own.
+    """
+    root = tmp_path / "repo"
+    base = root / "2024" / "quals" / "web-sappy"
+    _write(base / "attachments" / "handout.zip", "PK\x03\x04")
+    _write(base / "challenge" / "Dockerfile", "FROM node:20")
+    _write(base / "challenge" / "src" / "app.js", "console.log(1)")
+    _write(base / "healthcheck" / "healthcheck.py", "print('ok')")
+    # Challenge-level metadata sits at the parent top level (no direct artifact there).
+    _write(base / "metadata.yaml", "name: sappy\n")
+
+    raws = list(walk_repo(root, _seed(), "google/google-ctf", _SHA))
+
+    titles = {r.title for r in raws}
+    assert titles == {"web-sappy"}
+    for component in ("attachments", "challenge", "healthcheck"):
+        assert component not in titles
+    assert len(raws) == 1
+    # The single leaf still carries all its parts and derives its category from the name.
+    assert raws[0].local_dir == str(base)
+    assert map_category(raws[0].raw_category) is Category.WEB
 
 
 # --- [MEDIUM] git subprocess timeout ----------------------------------------

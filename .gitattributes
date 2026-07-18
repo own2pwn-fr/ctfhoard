@@ -1,6 +1,4 @@
-# Hybrid storage model: GitHub holds only TEXT (code, writeups, catalog); heavy
-# binaries live on the Hugging Face dataset (own2pwn-fr/ctfhoard-corpus), not here.
-# So there is no Git LFS on the GitHub side — binaries under data/corpus/ are
-# gitignored (see .gitignore). Catalog and corpus text stay diff-friendly.
+# GitHub holds only code + the normalized catalog (text). The complete hard-copy
+# corpus (data/corpus/, text + binary) lives on the Hugging Face dataset
+# own2pwn-fr/ctfhoard-corpus (git-LFS), not here — so no Git LFS is needed on GitHub.
 data/catalog/**  text
-data/corpus/**   text=auto

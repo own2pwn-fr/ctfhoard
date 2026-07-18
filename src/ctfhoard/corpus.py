@@ -14,6 +14,7 @@ challenge or its sources.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
@@ -72,21 +73,35 @@ def _copy_sources(raw_dir: Path, dest: Path) -> None:
     published corpus.
     """
     root = raw_dir.resolve()
-    for src in raw_dir.rglob("*"):
-        if src.is_dir() or src.is_symlink():
-            continue
-        # Refuse anything that resolves outside raw_dir (symlinked-directory escape).
-        try:
-            if not src.resolve().is_relative_to(root):
+    # os.walk with followlinks=False so we NEVER descend into symlinked directories
+    # (real repos, e.g. google-ctf, contain symlinked dirs like `exploit` -> ../..;
+    # rglob would follow them, duplicating files and creating file/dir name clashes
+    # that crash mkdir). Symlinked dirs are listed but not traversed; file symlinks
+    # are skipped explicitly.
+    for dirpath, dirnames, filenames in os.walk(raw_dir, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d != ".git"]  # prune VCS dir from walk
+        for fn in filenames:
+            src = Path(dirpath) / fn
+            if src.is_symlink():
                 continue
-        except OSError:
-            continue
-        rel = src.relative_to(raw_dir)
-        if ".git" in rel.parts:
-            continue
-        target = dest / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, target)
+            # Refuse anything that resolves outside raw_dir (defensive escape guard).
+            try:
+                if not src.resolve().is_relative_to(root):
+                    continue
+            except OSError:
+                continue
+            rel = src.relative_to(raw_dir)
+            if ".git" in rel.parts:
+                continue
+            target = dest / rel
+            # A name that is a file here but a directory elsewhere in the tree would
+            # make mkdir/copy raise; skip such a conflicting entry rather than abort.
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+            except (FileExistsError, NotADirectoryError, OSError) as exc:
+                logger.debug("skipped copying {}: {}", rel, exc)
+                continue
 
 
 def _stream_client(client: PoliteClient):
