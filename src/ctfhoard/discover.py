@@ -212,7 +212,7 @@ def resolve_token(explicit: str | None = None) -> str | None:
 
 
 def _rate_limit_wait(resp: httpx.Response) -> float:
-    """Seconds to sleep before retrying a 403/429 search response.
+    """Seconds to sleep before retrying a 403/429/5xx search response.
 
     Honors ``Retry-After`` (secondary limits), then an exhausted
     ``x-ratelimit-remaining`` with ``x-ratelimit-reset`` (primary limit), and finally
@@ -229,6 +229,14 @@ def _rate_limit_wait(resp: httpx.Response) -> float:
     return min(60.0, _MAX_BACKOFF)
 
 
+def _transient_wait(attempt: int) -> float:
+    """Exponential backoff (seconds) for a network error carrying no response to read.
+
+    Grows as ``_SEARCH_MIN_INTERVAL * 2**attempt`` and is clamped to :data:`_MAX_BACKOFF`.
+    """
+    return min(_SEARCH_MIN_INTERVAL * (2**attempt), _MAX_BACKOFF)
+
+
 def _search_page(
     query: str,
     page: int,
@@ -241,25 +249,40 @@ def _search_page(
 ) -> tuple[int, list[dict]]:
     """Fetch one search page, returning ``(total_count, items)``.
 
-    Serialized through ``limiter`` and resilient to rate limiting: on 403/429 it backs
-    off per :func:`_rate_limit_wait` and retries up to :data:`_MAX_RETRIES` times.
+    Serialized through ``limiter`` and resilient to *transient* failures: on 403/429 or
+    any 5xx it backs off per :func:`_rate_limit_wait`, and on a network/timeout error it
+    backs off per :func:`_transient_wait`, retrying up to :data:`_MAX_RETRIES` times.
+    Non-transient client errors (e.g. 422 malformed query) still raise immediately. When
+    retries are exhausted on a transient failure the page is *skipped* — returning
+    ``(0, [])`` with a warning — rather than aborting the whole discovery run so that
+    repos already enumerated by other shards/queries are preserved.
     """
     params: dict[str, str | int] = {"q": query, "per_page": per_page, "page": page}
     if sort:
         params["sort"] = sort
         params["order"] = "desc"
-    last: httpx.Response | None = None
     for attempt in range(_MAX_RETRIES):
         limiter.acquire()
-        resp = client.get(_SEARCH_URL, params=params, headers=_auth_headers(token))
-        last = resp
+        try:
+            resp = client.get(_SEARCH_URL, params=params, headers=_auth_headers(token))
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            wait = _transient_wait(attempt)
+            logger.warning(
+                "search request error ({}), backing off {:.0f}s (attempt {}/{})",
+                type(exc).__name__,
+                wait,
+                attempt + 1,
+                _MAX_RETRIES,
+            )
+            time.sleep(wait)
+            continue
         if resp.status_code == 200:
             body = resp.json()
             return int(body.get("total_count", 0)), list(body.get("items", []))
-        if resp.status_code in (403, 429):
+        if resp.status_code in (403, 429) or resp.status_code >= 500:
             wait = _rate_limit_wait(resp)
             logger.warning(
-                "search rate-limited ({}), backing off {:.0f}s (attempt {}/{})",
+                "search transient failure ({}), backing off {:.0f}s (attempt {}/{})",
                 resp.status_code,
                 wait,
                 attempt + 1,
@@ -268,8 +291,12 @@ def _search_page(
             time.sleep(wait)
             continue
         resp.raise_for_status()
-    assert last is not None
-    last.raise_for_status()
+    logger.warning(
+        "search page gave up after {} attempts (query={!r}, page={}); skipping",
+        _MAX_RETRIES,
+        query,
+        page,
+    )
     return 0, []
 
 
@@ -348,6 +375,18 @@ def _shard_by_stars(
     if total == 0:
         return
     if total <= _RESULT_CAP or lo >= hi:
+        if total > _RESULT_CAP:
+            # Base case with no room left to split (a single star value overflows the
+            # cap): we can only page the first 1000 results. Surface the loss so it is
+            # observable instead of silently truncating.
+            logger.warning(
+                "un-splittable shard {!r} still reports {} > {} results; "
+                "dropping ~{} repos beyond the search cap",
+                q,
+                total,
+                _RESULT_CAP,
+                total - _RESULT_CAP,
+            )
         for cand in search_repos(q, token=token, client=client, limiter=limiter):
             if cand.full_name not in seen:
                 seen.add(cand.full_name)

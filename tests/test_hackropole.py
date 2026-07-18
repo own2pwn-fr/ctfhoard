@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from ctfhoard.connectors.hackropole import CONNECTOR, HackropoleConnector
@@ -142,3 +143,70 @@ def test_enumerates_every_challenge_without_limit(tmp_path: Path, httpx_mock) ->
     # Category is read from each URL independently even though the HTML is identical.
     by_slug = {r.extra["slug"]: r for r in raws}
     assert by_slug["fcsc2023-web-salty-authentication"].raw_category == "web"
+
+
+def test_one_bad_page_does_not_abort_crawl(tmp_path: Path, monkeypatch) -> None:
+    # Regression: a single challenge page that persistently 5xxes (the retrying
+    # PoliteClient finally re-raises an HTTPStatusError) must not sink the whole
+    # crawl — the challenges before and after it must still be yielded.
+    url1 = "https://hackropole.fr/fr/challenges/crypto/fcsc2026-crypto-a-une-vache-pres/"
+    url2 = "https://hackropole.fr/fr/challenges/pwn/fcsc2024-pwn-boom/"
+    url3 = "https://hackropole.fr/fr/challenges/web/fcsc2023-web-salty-authentication/"
+    page = (_FIXTURES / "hackropole_challenge.html").read_text(encoding="utf-8")
+
+    conn = HackropoleConnector(tmp_path / "work")
+    monkeypatch.setattr(conn, "_challenge_urls", lambda: [url1, url2, url3])
+    # This test is about crawl resilience, not file mirroring — skip downloads.
+    monkeypatch.setattr(conn, "_download_files", lambda *a, **k: None)
+
+    def fake_get(url: str, **kwargs) -> httpx.Response:
+        request = httpx.Request("GET", url)
+        if url == url2:
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("persistent 500", request=request, response=response)
+        return httpx.Response(200, text=page, request=request)
+
+    monkeypatch.setattr(conn._client, "get", fake_get)
+
+    raws = list(conn.discover())
+    # URLs 1 and 3 survive; the broken middle page is skipped, not fatal.
+    assert [r.extra["slug"] for r in raws] == [
+        "fcsc2026-crypto-a-une-vache-pres",
+        "fcsc2023-web-salty-authentication",
+    ]
+
+
+def test_truncated_download_is_not_trusted(tmp_path: Path, httpx_mock) -> None:
+    # Regression: a transfer that delivers fewer bytes than its declared
+    # Content-Length (an aborted/killed download) must NOT be promoted to a trusted
+    # final handout — it must be discarded (only a .part could remain, and here even
+    # that is cleaned up) so the next run re-fetches it.
+    httpx_mock.add_response(url=_FILE_URL, content=b"partial", headers={"Content-Length": "999"})
+    conn = HackropoleConnector(tmp_path / "work")
+    dest = tmp_path / "work" / "chall"
+    dest.mkdir(parents=True)
+    name = "a-une-vache-pres.py"
+
+    conn._download_files([(_FILE_URL, name)], dest)
+
+    assert not (dest / name).exists()  # truncated body never trusted as final
+    assert not (dest / f"{name}.part").exists()  # scratch file cleaned up
+
+
+def test_leftover_part_is_redownloaded(tmp_path: Path, httpx_mock) -> None:
+    # Regression: a leftover ``<name>.part`` from a SIGKILLed run is an incomplete
+    # transfer; it must be discarded and the file re-downloaded (then atomically
+    # promoted to its final name), never mistaken for a finished handout.
+    httpx_mock.add_response(url=_FILE_URL, content=_FILE_BODY)
+    conn = HackropoleConnector(tmp_path / "work")
+    dest = tmp_path / "work" / "chall"
+    dest.mkdir(parents=True)
+    name = "a-une-vache-pres.py"
+    (dest / f"{name}.part").write_bytes(b"trunc")  # truncated leftover from a killed run
+
+    conn._download_files([(_FILE_URL, name)], dest)
+
+    final = dest / name
+    assert final.exists()
+    assert final.read_bytes() == _FILE_BODY  # fully re-downloaded
+    assert not (dest / f"{name}.part").exists()  # leftover cleaned up / promoted

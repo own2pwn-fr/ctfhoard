@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from ctfhoard.connectors.ctftime import (
@@ -193,3 +195,75 @@ def test_max_events_caps_events(tmp_path: Path, httpx_mock) -> None:
     _mock_writeups(httpx_mock)
     raws = list(_connector(tmp_path, max_events=1).discover())
     assert {r.event_name for r in raws} == {"corCTF 2022"}
+
+
+# -- window-sliding pagination ---------------------------------------------
+
+# Three distinct start-seconds inside [_START, _FINISH]; T1 is the page boundary
+# shared by two events (one that fits on the first page, one that does not).
+_T0 = "2022-06-01T00:00:00+00:00"
+_T1 = "2022-07-01T00:00:00+00:00"
+_T2 = "2022-08-01T00:00:00+00:00"
+
+
+def _ts(iso: str) -> int:
+    return int(datetime.fromisoformat(iso).timestamp())
+
+
+def _window_api_callback(events: list[dict]):
+    """A fake CTFtime events API honoring the ``start``/``finish``/``limit`` window.
+
+    Mirrors the real endpoint: it returns the first ``limit`` events whose start is
+    within ``[start, finish]``, sorted ascending by start. This is what makes the
+    off-by-one window bug observable — a naive ``start = max_start + 1`` slide skips
+    events sharing the boundary second, exactly as it would against the live API.
+    """
+
+    def callback(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        ws, fin, lim = int(params["start"]), int(params["finish"]), int(params["limit"])
+        page = sorted(
+            (e for e in events if ws <= _ts(e["start"]) <= fin),
+            key=lambda e: _ts(e["start"]),
+        )[:lim]
+        return httpx.Response(200, json=page)
+
+    return callback
+
+
+def test_window_pagination_keeps_boundary_second_events(tmp_path: Path, httpx_mock) -> None:
+    # Regression (#25): a FULL first page (len == event_limit) ends on second T1,
+    # which a second event also shares but which did not fit on that page. The window
+    # must slide to T1 (not T1 + 1) so the boundary event is re-served and kept; the
+    # seen-set dedupes the ones already emitted. Every distinct event exactly once.
+    events = [
+        {"id": 9001, "ctf_id": 1, "title": "e1", "start": _T0, "finish": _T0},
+        {"id": 9002, "ctf_id": 1, "title": "e2", "start": _T0, "finish": _T0},
+        {"id": 9003, "ctf_id": 1, "title": "e3", "start": _T1, "finish": _T1},  # boundary (fits)
+        {"id": 9004, "ctf_id": 1, "title": "e4", "start": _T1, "finish": _T1},  # boundary (cut)
+        {"id": 9005, "ctf_id": 1, "title": "e5", "start": _T2, "finish": _T2},
+    ]
+    httpx_mock.add_callback(_window_api_callback(events), url=_API_RE, is_reusable=True)
+
+    got = list(_connector(tmp_path, event_limit=3)._fetch_events())
+
+    ids = [e["id"] for e in got]
+    assert ids == [9001, 9002, 9003, 9004, 9005]  # boundary event 9004 not dropped
+    assert len(ids) == len(set(ids))  # emitted exactly once (no duplicate)
+
+
+def test_window_pagination_all_same_second_terminates(tmp_path: Path, httpx_mock) -> None:
+    # More events than a page, all sharing one start-second: the window can never
+    # advance, so termination must come from the seen-set + zero-new-events guard.
+    # (If it did not, list() below would hang forever.)
+    events = [
+        {"id": 8000 + i, "ctf_id": 1, "title": f"e{i}", "start": _T1, "finish": _T1}
+        for i in range(5)
+    ]
+    httpx_mock.add_callback(_window_api_callback(events), url=_API_RE, is_reusable=True)
+
+    got = list(_connector(tmp_path, event_limit=3)._fetch_events())
+
+    ids = [e["id"] for e in got]
+    assert len(ids) == len(set(ids))  # no duplicate emission
+    assert set(ids).issubset({8000, 8001, 8002, 8003, 8004})

@@ -58,6 +58,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+from loguru import logger
 from selectolax.parser import HTMLParser
 
 from ctfhoard import licenses
@@ -223,24 +224,38 @@ class HackropoleConnector(Connector):
         """Download each handout into ``dest`` (skipping ones over the size cap).
 
         Uses a streamed GET so an over-cap blob is abandoned without buffering it
-        whole. Failures on individual files are swallowed — a missing handout must
-        not sink the whole challenge record.
+        whole. Downloads are written to a ``<name>.part`` temp file and only
+        atomically renamed to their final name once fully received, so a finalized
+        file on disk is always complete — resume can safely trust it and skip the
+        re-download. Failures on individual files are swallowed (and their leftover
+        ``.part`` cleaned up) — a missing handout must not sink the whole record.
         """
         for url, name in file_links:
             target = dest / name
             if target.exists() and target.stat().st_size > 0:
-                continue  # resume: reuse cached download
+                continue  # resume: a finalized file is complete (written atomically)
+            part = dest / f"{name}.part"
             try:
                 self._stream_to_file(url, target)
-            except Exception:  # noqa: BLE001 — one bad file must not drop the challenge
+            except Exception as exc:  # noqa: BLE001 — one bad file must not drop the challenge
+                logger.debug("hackropole file download failed for {}: {}", url, exc)
                 target.unlink(missing_ok=True)
+                part.unlink(missing_ok=True)
 
     def _stream_to_file(self, url: str, target: Path) -> None:
-        """Stream ``url`` into ``target``, honoring the rate limiter and size cap.
+        """Stream ``url`` into ``target`` via a ``<name>.part`` temp file.
 
-        A file whose declared ``Content-Length`` exceeds the cap is skipped before
-        any body is read; a file that grows past the cap mid-stream is abandoned.
+        Honors the rate limiter and size cap. A file whose declared
+        ``Content-Length`` exceeds the cap is skipped before any body is read; a
+        file that grows past the cap mid-stream is abandoned. The bytes land in a
+        ``.part`` temp file that is only atomically promoted to ``target`` once the
+        transfer completes and (when a ``Content-Length`` is declared) its byte
+        count matches — so a truncated transfer from a killed run leaves only a
+        ``.part`` (never a trusted final file) and is re-downloaded on the next run.
         """
+        part = target.parent / f"{target.name}.part"
+        # A leftover .part is a truncated/aborted transfer — never trust it, redo.
+        part.unlink(missing_ok=True)
         self._limiter.acquire()
         with self._http.stream("GET", url) as resp:
             resp.raise_for_status()
@@ -248,14 +263,22 @@ class HackropoleConnector(Connector):
             if declared is not None and declared.isdigit() and int(declared) > MAX_FILE_BYTES:
                 return  # too large — do not materialize
             written = 0
-            with target.open("wb") as fh:
+            with part.open("wb") as fh:
                 for chunk in resp.iter_bytes():
                     written += len(chunk)
                     if written > MAX_FILE_BYTES:
                         fh.close()
-                        target.unlink(missing_ok=True)
+                        part.unlink(missing_ok=True)
                         return
                     fh.write(chunk)
+            # Verify the transfer is complete before trusting it: a body shorter
+            # than the declared length is a truncated download, not a handout.
+            if declared is not None and declared.isdigit() and written != int(declared):
+                part.unlink(missing_ok=True)
+                raise OSError(
+                    f"truncated download for {url}: {written}/{declared} bytes received"
+                )
+        part.replace(target)  # atomic promotion — target only ever exists complete
 
     def _parse_challenge(self, url: str, html: str) -> RawChallenge:
         tree = HTMLParser(html)
@@ -309,10 +332,21 @@ class HackropoleConnector(Connector):
         if self.limit is not None:
             urls = urls[: self.limit]
         for url in urls:
-            resp = self._client.get(url)
+            # One bad challenge page (a persistent 5xx the retrying client finally
+            # re-raises, a transport error, or a parse failure) must not sink the
+            # whole crawl — log it and move on to the next challenge.
+            try:
+                resp = self._client.get(url)
+            except Exception as exc:  # noqa: BLE001 — skip a bad page, don't abort the crawl
+                logger.warning("hackropole challenge fetch failed for {}: {}", url, exc)
+                continue
             if resp.status_code != 200:
                 continue  # deleted/redirected page — skip, don't abort the crawl
-            yield self._parse_challenge(url, resp.text)
+            try:
+                yield self._parse_challenge(url, resp.text)
+            except Exception as exc:  # noqa: BLE001 — skip a bad page, don't abort the crawl
+                logger.warning("hackropole challenge parse failed for {}: {}", url, exc)
+                continue
 
 
 CONNECTOR = HackropoleConnector

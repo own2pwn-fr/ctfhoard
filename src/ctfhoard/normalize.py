@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -88,11 +89,22 @@ _SOURCE_LANG_EXT = {
 }
 
 _DOCKER_NAMES = {"dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yaml"}
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
+# Unicode-aware: collapse runs of non-word chars (and underscores) into a single
+# separator. ``\w`` under ``re.UNICODE`` keeps CJK/Cyrillic/etc. word characters, so
+# non-ASCII titles produce a non-empty slug instead of collapsing to ''. ASCII
+# behavior is unchanged ('HITCON CTF' -> 'hitcon-ctf', 'baby_pwn' -> 'baby-pwn').
+_SLUG_RE = re.compile(r"[\W_]+", re.UNICODE)
 
 
 def slugify(text: str) -> str:
-    return _SLUG_RE.sub("-", text.lower()).strip("-")
+    """Lower-cased, Unicode-aware URL/filesystem slug.
+
+    NFKC-normalizes first so compatibility variants fold together, then replaces
+    runs of non-word characters with '-'. Returns '' only for input with no word
+    characters at all (e.g. emoji/punctuation-only); callers must guard against that.
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    return _SLUG_RE.sub("-", normalized.lower()).strip("-")
 
 
 def map_category(raw: str | None) -> Category:
@@ -112,12 +124,19 @@ def synthesize_id(
     """Stable synthetic id: hash of (event, year, title, category).
 
     Deterministic across re-ingestion so records upsert instead of duplicating.
+
+    The title contributes its slug, but a slug can collapse to '' (emoji/punctuation
+    -only titles). In that case distinct titles would share an id and last-write-wins
+    merging would silently drop challenges, so we anchor on a stable hash of the RAW
+    title instead — guaranteeing distinct titles always yield distinct ids.
     """
+    title_slug = slugify(title)
+    title_basis = title_slug or f"h:{hashlib.sha256(title.encode('utf-8')).hexdigest()[:16]}"
     basis = "|".join(
         [
             slugify(event_name or "unknown-event"),
             str(year or "0000"),
-            slugify(title),
+            title_basis,
             (category or "unknown").lower(),
         ]
     )
@@ -128,7 +147,11 @@ def build_file_manifest(local_dir: Path, *, size_cap: int = 50 * 1024 * 1024) ->
     """Walk a mirrored challenge dir into a list of ``FileEntry``.
 
     Files above ``size_cap`` are flagged ``lfs=True`` (their blob should be handled
-    by Git LFS / recorded as a pointer, not inlined into the catalog).
+    by Git LFS / recorded as a pointer, not inlined into the catalog). Hashing is
+    decoupled from that flag: we ALWAYS compute the streaming SHA-256 (cheap on
+    memory), so a large source file still carries a stable content identity. Leaving
+    ``sha256`` empty for big files would let two challenges that differ only in a
+    large binary share a content fingerprint and be wrongly merged.
     """
     entries: list[FileEntry] = []
     if not local_dir.exists():
@@ -144,7 +167,7 @@ def build_file_manifest(local_dir: Path, *, size_cap: int = 50 * 1024 * 1024) ->
         entries.append(
             FileEntry(
                 path=rel,
-                sha256="" if big else sha256_file(path),
+                sha256=sha256_file(path),
                 size=size,
                 is_source=is_source_file(rel),
                 lfs=big,
@@ -177,6 +200,9 @@ def normalize(raw: RawChallenge) -> Challenge:
 
     category = map_category(raw.raw_category)
     challenge_id = synthesize_id(raw.event_name, raw.year, raw.title, category.value)
+    # Guard against an empty slug (emoji/punctuation-only titles) by falling back to
+    # the id prefix, so ``slug`` is always usable as a URL/filesystem key.
+    slug = slugify(raw.title) or f"chal-{challenge_id[:8]}"
 
     event = None
     if raw.event_name:
@@ -190,7 +216,7 @@ def normalize(raw: RawChallenge) -> Challenge:
     challenge = Challenge(
         id=challenge_id,
         title=raw.title,
-        slug=slugify(raw.title),
+        slug=slug,
         event=event,
         event_name=raw.event_name,
         year=raw.year,

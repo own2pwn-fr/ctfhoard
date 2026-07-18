@@ -18,8 +18,9 @@ and ``subprocess.run``.
 
 from __future__ import annotations
 
+import contextlib
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
@@ -40,8 +41,12 @@ _CREATED_RE = re.compile(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
 
 
 def _fast_limiter() -> RateLimiter:
-    """A limiter with no delay so mocked tests never sleep."""
-    return RateLimiter(min_interval=0.0)
+    """A limiter with no delay so mocked tests never sleep.
+
+    A huge refill rate + burst keeps the token bucket effectively unlimited, so the
+    many requests emitted by the sharding tests never block on token replenishment.
+    """
+    return RateLimiter(rate=1e9, per=1.0, burst=1e9, min_interval=0.0)
 
 
 def _repo_obj(full_name: str, *, topics: list[str] | None = None) -> dict:
@@ -67,6 +72,19 @@ def _json(total: int, items: list[dict]) -> httpx.Response:
 def _page_slice(names: list[str], page: int, per_page: int) -> list[dict]:
     start = (page - 1) * per_page
     return [_repo_obj(n) for n in names[start : start + per_page]]
+
+
+@contextlib.contextmanager
+def _captured_warnings():
+    """Collect the module's loguru WARNING+ messages emitted inside the block."""
+    records: list[str] = []
+    sink_id = discover.logger.add(
+        lambda msg: records.append(str(msg)), level="WARNING", format="{message}"
+    )
+    try:
+        yield records
+    finally:
+        discover.logger.remove(sink_id)
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +136,215 @@ def test_over_cap_triggers_date_bisection(httpx_mock) -> None:
     for req in httpx_mock.get_requests():
         m = _CREATED_RE.search(req.url.params["q"])
         if m:
-            windows.add((m.group(1), m.group(2)))
+            windows.add((date.fromisoformat(m.group(1)), date.fromisoformat(m.group(2))))
+
+    root_lo, root_hi = date(2020, 1, 1), date(2023, 6, 30)
+    root = (root_lo, root_hi)
     # Root window plus at least the two bisected children were all queried.
-    assert ("2020-01-01", "2023-06-30") in windows
+    assert root in windows
     assert len(windows) >= 3
-    children = [w for w in windows if w != ("2020-01-01", "2023-06-30")]
-    assert all(w[0] != "2020-01-01" or w[1] != "2023-06-30" for w in children)
+
+    # Real narrowing/containment: every non-root child window lies strictly inside the
+    # root range AND spans strictly fewer days than the root (no re-querying the root,
+    # no widening).
+    root_span = root_hi - root_lo
+    for lo_d, hi_d in windows:
+        assert root_lo <= lo_d <= hi_d <= root_hi
+        if (lo_d, hi_d) != root:
+            assert (hi_d - lo_d) < root_span
+
+    # The two first-level children partition the root at mid / mid+1 exactly — no gap,
+    # no overlap — matching the bisection in ``_shard_by_dates``.
+    mid = root_lo + (root_hi - root_lo) // 2
+    assert (root_lo, mid) in windows
+    assert (mid + timedelta(days=1), root_hi) in windows
+
+
+# ---------------------------------------------------------------------------
+# (a2) stars-bisection fallback for a single-day window over the cap
+# ---------------------------------------------------------------------------
+_STARS_RE = re.compile(r"stars:(\d+)\.\.(\d+)")
+
+
+def test_single_day_overflow_falls_back_to_stars(httpx_mock, monkeypatch) -> None:
+    """A single ``created:D..D`` day reporting >1000 forces ``stars:`` bisection.
+
+    The mock models 1500 repos on one day, each with a distinct star count 0..1499, so
+    only ``stars:`` sub-windows narrow enough (<=1000 span) become pageable leaves. We
+    assert the fallback fires (queries gain ``stars:`` qualifiers), every repo is
+    enumerated exactly once (deduped), and the ``lo>=hi`` recursion terminates without
+    an off-by-one infinite loop.
+    """
+    monkeypatch.setattr(discover.time, "sleep", lambda _s: None)
+    n_repos = 1500  # star value == index, so repo i matches stars:lo..hi iff lo<=i<=hi
+
+    def callback(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        q = params["q"]
+        page = int(params.get("page", "1"))
+        per_page = int(params.get("per_page", "100"))
+        sm = _STARS_RE.search(q)
+        if sm is None:
+            # Bare created:D..D probe — the whole day overflows the cap.
+            return _json(n_repos, [])
+        lo, hi = int(sm.group(1)), int(sm.group(2))
+        matched = [i for i in range(n_repos) if lo <= i <= hi]
+        if per_page == 1:
+            return _json(len(matched), [])  # cheap total-only probe
+        names = [f"acme/star-{i}" for i in matched]
+        return _json(len(matched), _page_slice(names, page, per_page))
+
+    httpx_mock.add_callback(
+        callback, url=re.compile(r"https://api\.github\.com/search/.*"), is_reusable=True
+    )
+
+    cands = list(
+        sharded_search(
+            "topic:ctf",
+            token=None,
+            start=date(2020, 1, 1),
+            end=date(2020, 1, 1),
+            client=httpx.Client(),
+            limiter=_fast_limiter(),
+        )
+    )
+
+    # Fallback fired: some queries carried a stars: qualifier.
+    star_queries = [
+        req for req in httpx_mock.get_requests() if _STARS_RE.search(req.url.params["q"])
+    ]
+    assert star_queries, "expected stars: bisection to be triggered"
+
+    # Every repo enumerated once (deduped across overlapping leaves). Each pageable leaf
+    # spans <=1000 stars, so all 1500 are reachable across the star shards.
+    names = [c.full_name for c in cands]
+    assert len(names) == len(set(names)) == n_repos
+
+
+# ---------------------------------------------------------------------------
+# (a3) un-splittable star bucket still over the cap → observable warning
+# ---------------------------------------------------------------------------
+def test_unsplittable_star_bucket_warns(httpx_mock, monkeypatch) -> None:
+    """A single star value holding >1000 repos can't be split further: warn, don't loop.
+
+    All repos share the exact star count 5, so ``stars:`` bisection converges on the
+    degenerate ``stars:5..5`` window that still reports >1000. The base case must emit a
+    WARNING about the dropped overflow and terminate (no infinite recursion).
+    """
+    monkeypatch.setattr(discover.time, "sleep", lambda _s: None)
+    total = 1200
+    star_value = 5
+
+    def callback(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        q = params["q"]
+        page = int(params.get("page", "1"))
+        per_page = int(params.get("per_page", "100"))
+        sm = _STARS_RE.search(q)
+        if sm is None:
+            return _json(total, [])
+        lo, hi = int(sm.group(1)), int(sm.group(2))
+        if not (lo <= star_value <= hi):
+            return _json(0, [])
+        if per_page == 1:
+            return _json(total, [])  # cheap total-only probe
+        names = [f"acme/pop-{i}" for i in range(total)]
+        return _json(total, _page_slice(names, page, per_page))
+
+    httpx_mock.add_callback(
+        callback, url=re.compile(r"https://api\.github\.com/search/.*"), is_reusable=True
+    )
+
+    with _captured_warnings() as warnings:
+        cands = list(
+            sharded_search(
+                "topic:ctf",
+                token=None,
+                start=date(2020, 1, 1),
+                end=date(2020, 1, 1),
+                client=httpx.Client(),
+                limiter=_fast_limiter(),
+            )
+        )
+
+    # Reaching here at all proves the lo>=hi base case terminated (no infinite loop).
+    assert any("un-splittable shard" in w for w in warnings)
+    assert any(str(total - discover._RESULT_CAP) in w for w in warnings)
+    # We still page the first 1000 of the overflowing bucket rather than nothing.
+    assert len(cands) == discover._RESULT_CAP
+
+
+# ---------------------------------------------------------------------------
+# (a4) transient 5xx / network errors are retried, not fatal
+# ---------------------------------------------------------------------------
+def test_transient_5xx_page_retries_then_succeeds(httpx_mock, monkeypatch) -> None:
+    """A leaf-shard page that returns 503 once then 200 is retried and succeeds."""
+    monkeypatch.setattr(discover.time, "sleep", lambda _s: None)
+    state = {"data_hits": 0}
+
+    def callback(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        page = int(params.get("page", "1"))
+        per_page = int(params.get("per_page", "100"))
+        names = ["team/a", "team/b", "team/c"]
+        if per_page == 100 and page == 1:
+            state["data_hits"] += 1
+            if state["data_hits"] == 1:
+                return httpx.Response(503)  # transient server error on first try
+        return _json(len(names), _page_slice(names, page, per_page))
+
+    httpx_mock.add_callback(
+        callback, url=re.compile(r"https://api\.github\.com/search/.*"), is_reusable=True
+    )
+
+    cands = list(
+        sharded_search(
+            "topic:ctf",
+            token=None,
+            start=date(2020, 1, 1),
+            end=date(2020, 1, 1),
+            client=httpx.Client(),
+            limiter=_fast_limiter(),
+        )
+    )
+
+    assert {c.full_name for c in cands} == {"team/a", "team/b", "team/c"}
+    assert state["data_hits"] >= 2, "the 503 page must have been retried"
+
+
+def test_persistent_failure_skips_shard_not_run(httpx_mock, monkeypatch) -> None:
+    """A page failing persistently (503 / network) skips that shard, not the whole run.
+
+    One query keeps returning 503 (retries exhausted → page skipped); another keeps
+    raising a network error; a healthy query still yields its repos. The run must
+    complete and preserve the repos it could enumerate.
+    """
+    monkeypatch.setattr(discover.time, "sleep", lambda _s: None)
+
+    def callback(request: httpx.Request) -> httpx.Response:
+        q = request.url.params["q"]
+        page = int(request.url.params.get("page", "1"))
+        per_page = int(request.url.params.get("per_page", "100"))
+        if "good" in q:
+            names = ["team/g1", "team/g2"]
+            return _json(len(names), _page_slice(names, page, per_page))
+        if "netfail" in q:
+            raise httpx.ConnectError("connection reset")
+        return httpx.Response(503)  # "srvfail" query: persistent server error
+
+    httpx_mock.add_callback(
+        callback, url=re.compile(r"https://api\.github\.com/search/.*"), is_reusable=True
+    )
+
+    found = discover_all(
+        token=None,
+        queries=["good in:name", "srvfail in:name", "netfail in:name"],
+        client=httpx.Client(),
+        limiter=_fast_limiter(),
+    )
+
+    # The failing queries were skipped; the healthy query's repos survived.
+    assert set(found) == {"team/g1", "team/g2"}
 
 
 # ---------------------------------------------------------------------------

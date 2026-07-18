@@ -20,15 +20,22 @@ from pathlib import Path
 from ctfhoard import licenses
 from ctfhoard.schema import LicenseInfo
 
-#: Root license filenames we probe, in priority order, when a repo declares no SPDX.
-_LICENSE_FILENAMES: tuple[str, ...] = (
-    "LICENSE",
-    "LICENSE.md",
-    "LICENSE.txt",
-    "COPYING",
-    "COPYING.txt",
-    "COPYING.md",
-)
+#: Filename prefixes (lowercased) of root license files we probe when a repo declares
+#: no SPDX. Matched case-insensitively against the *start* of a file name so common
+#: variants — ``LICENSE``, ``LICENSE.md``, ``LICENSE-MIT``, ``LICENCE``, ``COPYING``,
+#: ``COPYING.md``, ``UNLICENSE`` — are all picked up.
+_LICENSE_PREFIXES: tuple[str, ...] = ("license", "licence", "copying", "unlicense")
+
+#: Upper bound on bytes read from an untrusted LICENSE probe. A repo can ship a
+#: multi-gigabyte file named ``LICENSE`` (or anything matching the prefixes); slurping
+#: it whole would OOM a cheap metadata probe, so we only read a bounded prefix — the
+#: license marker phrases all live in the first few hundred bytes anyway.
+_MAX_PROBE_BYTES: int = 1024 * 1024  # 1 MiB
+
+#: Default wall-clock timeout (seconds) for a single git subprocess. Generous enough
+#: for a large shallow clone but finite, so a huge or stalled repo cannot hang the
+#: whole run forever — on timeout the process is killed and the repo is skipped.
+_GIT_TIMEOUT: float = 600.0
 
 
 class MirrorError(RuntimeError):
@@ -52,36 +59,64 @@ def _git_env() -> dict[str, str]:
     return env
 
 
-def _run_git(args: list[str], *, cwd: Path | None = None) -> str:
-    """Run a git subcommand, returning stdout; raise :class:`MirrorError` on failure."""
-    proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["git", *args],
-        cwd=str(cwd) if cwd else None,
-        env=_git_env(),
-        capture_output=True,
-        text=True,
-    )
+def _read_text_bounded(path: Path, *, limit: int = _MAX_PROBE_BYTES) -> str:
+    """Read at most ``limit`` bytes of ``path`` and decode as text.
+
+    Untrusted probe files (LICENSE variants) can be arbitrarily large; reading a
+    bounded prefix keeps a cheap metadata probe from OOM-ing on a pathological file.
+    """
+    with path.open("rb") as fh:
+        raw = fh.read(limit)
+    return raw.decode("utf-8", errors="replace")
+
+
+def _run_git(
+    args: list[str], *, cwd: Path | None = None, timeout: float = _GIT_TIMEOUT
+) -> str:
+    """Run a git subcommand, returning stdout; raise :class:`MirrorError` on failure.
+
+    ``timeout`` bounds the wall-clock time of the call; on expiry the child process is
+    killed (by :func:`subprocess.run`) and a :class:`MirrorError` is raised so the
+    caller can skip the offending repo and continue instead of hanging forever.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", *args],
+            cwd=str(cwd) if cwd else None,
+            env=_git_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # subprocess.run has already killed and reaped the child on timeout.
+        cmd = " ".join(["git", *args])
+        raise MirrorError(f"`{cmd}` timed out after {timeout:.0f}s") from exc
     if proc.returncode != 0:
         cmd = " ".join(["git", *args])
         raise MirrorError(f"`{cmd}` failed ({proc.returncode}): {proc.stderr.strip()}")
     return proc.stdout
 
 
-def clone_pinned(repo: str, workdir: Path, *, depth: int = 1) -> tuple[Path, str]:
+def clone_pinned(
+    repo: str, workdir: Path, *, depth: int = 1, timeout: float = _GIT_TIMEOUT
+) -> tuple[Path, str]:
     """Shallow-clone ``owner/name`` into ``workdir`` and return (path, commit_sha).
 
     The clone lands in ``workdir/<owner>__<name>``. If that directory already holds
     a git checkout it is reused as-is (idempotent / resumable — re-running the
     connector does not re-download), otherwise a fresh ``git clone --depth`` is run.
     ``commit_sha`` is the resolved ``HEAD`` (``git rev-parse HEAD``), i.e. the exact
-    commit the emitted challenges are pinned to for provenance.
+    commit the emitted challenges are pinned to for provenance. ``timeout`` bounds
+    each underlying git call so a huge or stalled clone raises :class:`MirrorError`
+    instead of hanging the run.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     local_path = workdir / _repo_dirname(repo)
     if not (local_path / ".git").exists():
         url = f"https://github.com/{repo}.git"
-        _run_git(["clone", "--depth", str(depth), url, str(local_path)])
-    sha = _run_git(["rev-parse", "HEAD"], cwd=local_path).strip()
+        _run_git(["clone", "--depth", str(depth), url, str(local_path)], timeout=timeout)
+    sha = _run_git(["rev-parse", "HEAD"], cwd=local_path, timeout=timeout).strip()
     if not sha:
         raise MirrorError(f"could not resolve HEAD for {repo} at {local_path}")
     return local_path, sha
@@ -102,13 +137,35 @@ def detect_repo_license(local_path: Path, *, declared_spdx: str | None) -> Licen
     """
     if declared_spdx:
         return licenses.from_spdx(declared_spdx, note="declared in seeds")
-    for name in _LICENSE_FILENAMES:
-        candidate = local_path / name
-        if candidate.is_file():
-            text = candidate.read_text(encoding="utf-8", errors="replace")
-            return licenses.detect_from_text(text, source_file=name)
+    best: LicenseInfo | None = None
+    for candidate in _iter_license_files(local_path):
+        text = _read_text_bounded(candidate)
+        info = licenses.detect_from_text(text, source_file=candidate.name)
+        if best is None or info.confidence > best.confidence:
+            best = info
+    if best is not None:
+        return best
     return LicenseInfo(
         redistributable=False,
         confidence=0.0,
         note="no declared SPDX and no root LICENSE/COPYING file found",
     )
+
+
+def _iter_license_files(local_path: Path) -> list[Path]:
+    """Return root-level LICENSE/LICENCE/COPYING/UNLICENSE files, case-insensitively.
+
+    Globbing on a case-sensitive filesystem would miss ``licence``/``Copying`` etc.,
+    so we scan the root directory once and prefix-match each entry's lowercased name
+    against :data:`_LICENSE_PREFIXES` (which also catches variants like ``LICENSE-MIT``
+    and ``COPYING.md``). Returned sorted for deterministic probing order.
+    """
+    try:
+        entries = sorted(local_path.iterdir())
+    except OSError:
+        return []
+    return [
+        entry
+        for entry in entries
+        if entry.is_file() and entry.name.lower().startswith(_LICENSE_PREFIXES)
+    ]
