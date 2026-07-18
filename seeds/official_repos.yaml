@@ -1,0 +1,123 @@
+# Authoritative CTF source & writeup repositories to mirror.
+#
+# Consumed by the (Phase 1) `git_repo` connector: each entry is cloned/pinned by
+# SHA, walked into per-challenge RawChallenge records, and license-tagged. Licenses
+# here are the *declared blanket* license where one exists; per-challenge/per-author
+# copyrights may still apply (noted). Community archives without a blanket license
+# get `license: null` → the connector must detect per-repo/per-file and default to
+# not-redistributable.
+#
+# fields:
+#   repo:        owner/name on GitHub
+#   kind:        sources | writeups | mixed
+#   license:     declared SPDX blanket license, or null (detect per-repo)
+#   official:    true if first-party organizer source (top canonicalization authority)
+#   layout:      hint for the tree-walker (freeform)
+#   note:        caveats
+
+official_sources:
+  - repo: google/google-ctf
+    kind: sources
+    license: Apache-2.0
+    official: true
+    layout: "<year>/<category>/<challenge>"
+    note: "Official Google CTF archive 2017–present."
+
+  - repo: Nautilus-Institute/quals-2022
+    kind: sources
+    license: null
+    official: true
+    note: "DEF CON 30 quals. License varies per challenge — detect."
+  - repo: Nautilus-Institute/quals-2023
+    kind: sources
+    license: null
+    official: true
+  - repo: Nautilus-Institute/quals-2024
+    kind: sources
+    license: null
+    official: true
+  - repo: Nautilus-Institute/quals-2025
+    kind: sources
+    license: null
+    official: true
+  - repo: Nautilus-Institute/finals-2025
+    kind: sources
+    license: null
+    official: true
+
+  - repo: dicegang/dicectf-2022-challenges
+    kind: mixed
+    license: null
+    official: true
+    note: "DiceCTF; challenges + writeups. Detect per-challenge license."
+  - repo: dicegang/dicectf-2023-challenges
+    kind: mixed
+    license: null
+    official: true
+  - repo: dicegang/dicectf-quals-2025-challenges
+    kind: mixed
+    license: null
+    official: true
+
+  - repo: justcatthefish/justctf-2023
+    kind: sources
+    license: null
+    official: true
+
+  - repo: picoCTF/picoCTF-2019-example-problems
+    kind: sources
+    license: MIT
+    official: true
+    note: "picoCTF 2019 example problem sources (archived)."
+
+community_archives:
+  - repo: sajjadium/ctf-archives
+    kind: sources
+    license: MIT
+    official: false
+    layout: "CTFs/<event>/<year>/[Quals|Finals]/<category>/<challenge>"
+    note: "Broadest challenge-source archive (2017–2026). MIT covers the AGGREGATION;
+           individual challenge copyrights remain with authors — per-challenge caution."
+  - repo: pwncollege/ctf-archive
+    kind: sources
+    license: null
+    official: false
+    layout: "<challenge>/ with README + REHOST.md"
+    note: "100+ events 2011–2026. No blanket license — per-author attribution."
+  - repo: j00ru/ctf-tasks
+    kind: sources
+    license: null
+    official: false
+    note: "Low-level/pwn challenge archive across many years."
+  - repo: cryptohack/ctf_archive
+    kind: sources
+    license: null
+    official: false
+    note: "Crypto challenges from past CTFs."
+  - repo: NYU-LLM-CTF/NYU_CTF_Bench
+    kind: sources
+    license: GPL-2.0-or-later
+    official: false
+    layout: "<year>/<event>/<category>/<challenge> with challenge.json"
+    note: "CSAW-derived benchmark; clean challenge.json metadata + nyuctf package."
+
+writeup_archives:
+  - repo: ctfs/write-ups-2017
+    kind: writeups
+    license: null
+    official: false
+    note: "Classic community writeup wiki (also 2013–2016 sibling repos)."
+  - repo: ByteBandits/writeups
+    kind: writeups
+    license: null
+    official: false
+  - repo: daffainfo/ctf-writeup
+    kind: writeups
+    license: null
+    official: false
+    note: "550+ writeups."
+  - repo: perfectblue/ctf-writeups
+    kind: writeups
+    license: null
+    official: true
+    note: "Team writeups (perfect blue)."

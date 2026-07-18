@@ -46,6 +46,26 @@ _CATEGORY_MAP: dict[str, Category] = {
     "programming": Category.PROGRAMMING,
     "ppc": Category.PROGRAMMING,
     "misc": Category.MISC,
+    "miscellaneous": Category.MISC,
+    # Web-application vulnerability classes (OWASP-style labels, e.g. Juice Shop):
+    # these are all web challenges unless they clearly belong elsewhere.
+    "injection": Category.WEB,
+    "xss": Category.WEB,
+    "cross site scripting": Category.WEB,
+    "broken access control": Category.WEB,
+    "broken authentication": Category.WEB,
+    "sensitive data exposure": Category.WEB,
+    "security misconfiguration": Category.WEB,
+    "vulnerable components": Category.WEB,
+    "improper input validation": Category.WEB,
+    "insecure deserialization": Category.WEB,
+    "xxe": Category.WEB,
+    "server side request forgery": Category.WEB,
+    "ssrf": Category.WEB,
+    "unvalidated redirects": Category.WEB,
+    "forgotten content": Category.WEB,
+    "security through obscurity": Category.MISC,
+    "cryptographic issues": Category.CRYPTO,
 }
 
 _SOURCE_LANG_EXT = {

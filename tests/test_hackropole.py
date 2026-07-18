@@ -1,0 +1,144 @@
+"""Offline tests for the Hackropole connector.
+
+Fully deterministic: the sitemap, the challenge page, and the file download are
+all mocked with pytest-httpx and served from committed fixtures — no network is
+touched. We assert the connector's HTML field extraction (category, tags,
+difficulty, description, author, writeups), that it materializes the challenge's
+files under ``local_dir``, and that ``normalize()`` turns the result into a
+redistributable ``Challenge`` with a mapped category and detected source.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from ctfhoard.connectors.hackropole import CONNECTOR, HackropoleConnector
+from ctfhoard.normalize import normalize
+from ctfhoard.schema import Category, Origin
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+_SITEMAP_URL = "https://hackropole.fr/fr/sitemap.xml"
+_CRYPTO_URL = "https://hackropole.fr/fr/challenges/crypto/fcsc2026-crypto-a-une-vache-pres/"
+_WEB_URL = "https://hackropole.fr/fr/challenges/web/fcsc2023-web-salty-authentication/"
+_FILE_URL = (
+    "https://hackropole.fr/challenges/fcsc2026-crypto-a-une-vache-pres/public/a-une-vache-pres.py"
+)
+_FILE_BODY = b"# SageMath solution stub\nprint('FCSC{...}')\n"
+
+
+def _mock_sitemap(httpx_mock) -> None:
+    httpx_mock.add_response(
+        url=_SITEMAP_URL,
+        text=(_FIXTURES / "hackropole_sitemap.xml").read_text(encoding="utf-8"),
+    )
+
+
+def _mock_crypto_page(httpx_mock) -> None:
+    httpx_mock.add_response(
+        url=_CRYPTO_URL,
+        text=(_FIXTURES / "hackropole_challenge.html").read_text(encoding="utf-8"),
+    )
+    httpx_mock.add_response(url=_FILE_URL, content=_FILE_BODY)
+
+
+def test_registry_binding() -> None:
+    assert CONNECTOR is HackropoleConnector
+    assert HackropoleConnector.cli_name == "hackropole"
+    assert HackropoleConnector.origin is Origin.HACKROPOLE
+
+
+def test_sitemap_enumeration_respects_limit(tmp_path: Path, httpx_mock) -> None:
+    # Only the sitemap and the first challenge (+ its file) are fetched with limit=1.
+    _mock_sitemap(httpx_mock)
+    _mock_crypto_page(httpx_mock)
+    conn = HackropoleConnector(tmp_path / "work", limit=1)
+    raws = list(conn.discover())
+    assert len(raws) == 1
+    assert raws[0].extra["slug"] == "fcsc2026-crypto-a-une-vache-pres"
+
+
+@pytest.fixture
+def raw(tmp_path: Path, httpx_mock):
+    _mock_sitemap(httpx_mock)
+    _mock_crypto_page(httpx_mock)
+    conn = HackropoleConnector(tmp_path / "work", limit=1)
+    return next(iter(conn.discover()))
+
+
+def test_field_extraction(raw) -> None:
+    assert raw.origin is Origin.HACKROPOLE
+    assert raw.title == "À une vache près"
+    assert raw.event_name == "FCSC 2026"
+    assert raw.year == 2026
+    assert raw.raw_category == "crypto"  # taken from the URL path segment
+    assert raw.tags == ["sagemath"]  # category + edition badges are excluded
+    assert raw.difficulty == "3/5"  # three filled stars
+    assert "courbe elliptique" in raw.description
+    assert raw.extra["authors"] == ["jp"]
+
+
+def test_writeups_parsed_and_deduped(raw) -> None:
+    # The solutions table links the same writeup twice (two stretched links per row);
+    # they must collapse to a single Writeup.
+    assert len(raw.writeups) == 1
+    wu = raw.writeups[0]
+    assert wu.origin is Origin.HACKROPOLE
+    assert str(wu.url).endswith("/cecf5439-cd60-4ac3-895f-2cb4e055ab4b/")
+
+
+def test_files_downloaded_into_local_dir(raw) -> None:
+    assert raw.local_dir is not None
+    local = Path(raw.local_dir)
+    downloaded = local / "a-une-vache-pres.py"
+    assert downloaded.exists()
+    assert downloaded.read_bytes() == _FILE_BODY
+
+
+def test_source_is_official_etalab(raw) -> None:
+    src = raw.source
+    assert src is not None
+    assert src.is_official is True
+    assert str(src.url) == _CRYPTO_URL
+    assert src.license.spdx_id == "etalab-2.0"
+    assert src.license.redistributable is True
+
+
+def test_normalize_produces_redistributable_challenge(raw) -> None:
+    chal = normalize(raw)
+    assert chal.category is Category.CRYPTO  # "crypto" mapped
+    assert chal.raw_category == "crypto"
+    assert chal.event_name == "FCSC 2026"
+    assert chal.difficulty == "3/5"
+    # The .py handout is challenge source -> whitebox flag set, license carries over.
+    assert chal.has_source is True
+    assert "python" in chal.solve_languages
+    assert chal.redistributable is True
+    assert chal.license.spdx_id == "etalab-2.0"
+    assert any(str(f.path) == "a-une-vache-pres.py" for f in chal.files)
+
+
+def test_enumerates_every_challenge_without_limit(tmp_path: Path, httpx_mock) -> None:
+    # No limit: both challenge URLs in the sitemap are visited. We serve the same
+    # (crypto) page fixture for both — the count and per-URL slug/category are what
+    # matter here.
+    _mock_sitemap(httpx_mock)
+    page = (_FIXTURES / "hackropole_challenge.html").read_text(encoding="utf-8")
+    httpx_mock.add_response(url=_CRYPTO_URL, text=page)
+    httpx_mock.add_response(url=_WEB_URL, text=page)
+    # Both pages reference the same handout URL; each visited challenge downloads it
+    # into its own dir, so the single-use mock is registered once per fetch.
+    httpx_mock.add_response(url=_FILE_URL, content=_FILE_BODY)
+    httpx_mock.add_response(url=_FILE_URL, content=_FILE_BODY)
+    conn = HackropoleConnector(tmp_path / "work")
+    raws = list(conn.discover())
+    assert len(raws) == 2
+    slugs = {r.extra["slug"] for r in raws}
+    assert slugs == {
+        "fcsc2026-crypto-a-une-vache-pres",
+        "fcsc2023-web-salty-authentication",
+    }
+    # Category is read from each URL independently even though the HTML is identical.
+    by_slug = {r.extra["slug"]: r for r in raws}
+    assert by_slug["fcsc2023-web-salty-authentication"].raw_category == "web"

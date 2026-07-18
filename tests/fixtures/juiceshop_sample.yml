@@ -1,0 +1,29 @@
+---
+-
+  name: 'Password Hash Leak'
+  category: 'Sensitive Data Exposure'
+  description: 'Obtain the password (hash) of the currently logged-in user directly from a REST API endpoint.'
+  difficulty: 2
+  hints:
+    - 'Use your DevTools or a proxy to inspect network traffic.'
+  mitigationUrl: 'https://owasp.org/API-Security/editions/2019/en/0xa3-excessive-data-exposure'
+  key: passwordHashLeakChallenge
+-
+  name: 'API-only XSS'
+  category: 'XSS'
+  tags:
+    - Danger Zone
+  description: 'Perform a persisted XSS attack without using the frontend application at all.'
+  difficulty: 3
+  hints:
+    - 'You need to work with the server-side API directly.'
+  mitigationUrl: 'https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html'
+  key: restfulXssChallenge
+-
+  name: 'Admin Section'
+  category: 'Broken Access Control'
+  tags:
+    - Good for Demos
+  description: 'Access the administration section of the store.'
+  difficulty: 2
+  key: adminSectionChallenge
