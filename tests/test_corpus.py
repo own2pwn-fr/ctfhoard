@@ -361,3 +361,32 @@ def test_materialize_skips_symlinked_sources_escaping_raw_dir(tmp_path):
     for p in corpus.rglob("*"):
         if p.is_file():
             assert b"TOPSECRET" not in p.read_bytes()
+
+
+def test_materialize_survives_symlinked_dir_in_sources(tmp_path):
+    # Regression: real repos (e.g. google-ctf) ship symlinked directories such as
+    # `exploit -> ../solution`. rglob would follow them, duplicating files and
+    # triggering a FileExistsError on mkdir when a name is a file here and a dir
+    # there. _copy_sources must walk with followlinks=False and never crash.
+    raw = tmp_path / "raw"
+    (raw / "solution").mkdir(parents=True)
+    (raw / "solution" / "sploit.py").write_text("# solve\n")
+    (raw / "chal.c").write_text("int main(){}\n")
+    # a symlinked directory pointing elsewhere in the tree
+    (raw / "exploit").symlink_to(raw / "solution", target_is_directory=True)
+
+    ch = Challenge(
+        id="ffeeddccbbaa998877665544",
+        title="Sym Chall",
+        event_name="Test CTF",
+        year=2024,
+        sources=[Source(origin=Origin.GITHUB, repo="x/y")],
+    )
+    # must not raise
+    materialize_challenge(ch, tmp_path / "corpus", raw_dir=raw, client=None)
+
+    dest = tmp_path / "corpus" / challenge_relpath(ch)
+    assert (dest / "chal.c").exists()
+    assert (dest / "solution" / "sploit.py").exists()
+    # the symlinked dir itself is not copied/traversed as a real directory
+    assert not (dest / "exploit").is_dir()
