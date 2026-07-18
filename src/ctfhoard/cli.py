@@ -224,5 +224,75 @@ def publish_hf(
         typer.echo(result)
 
 
+@app.command("mirror")
+def mirror(
+    source: str = typer.Option(
+        "seeds", help="Repo list: seeds | discovered | both."
+    ),
+    only: list[str] = typer.Option(
+        None, "--only", help="Mirror exactly these repos (repeatable); overrides --source."
+    ),
+    data_dir: Path = typer.Option(DEFAULT_DATA, help="Root data directory."),
+    dataset: str = typer.Option(hf.HF_CORPUS_DATASET, help="Target HF dataset repo id."),
+    publish: bool = typer.Option(True, help="Publish each repo's corpus + catalog to HF."),
+    keep_local: bool = typer.Option(
+        False, help="Keep the per-repo staging corpus on disk after publishing."
+    ),
+    max_repo_size_mb: int = typer.Option(
+        4096, help="Cap (MB) on a discovered repo's size before cloning."
+    ),
+    resume: bool = typer.Option(True, help="Skip repos already recorded 'ok' in the manifest."),
+    token: str = typer.Option(
+        None, help="Hugging Face token; defaults to the HF_TOKEN environment variable."
+    ),
+) -> None:
+    """Stream-mirror many repos to the HF dataset, one repo at a time.
+
+    For each repo: clone → normalize → dedup → materialize hard copies → publish that
+    repo's corpus subtree + catalog shard to HF → delete the raw clone (and staging,
+    unless --keep-local). Peak local disk stays bounded to roughly one repo. Resumable
+    via ``data_dir/mirror_state.jsonl``.
+    """
+    from ctfhoard import pipeline
+
+    if source not in {"seeds", "discovered", "both"}:
+        typer.echo(f"unknown --source '{source}' (expected seeds|discovered|both)")
+        raise typer.Exit(code=1)
+
+    repos = pipeline.resolve_repo_list(
+        data_dir=data_dir, source=source, only=list(only) if only else None
+    )
+    if not repos:
+        typer.echo("no repos to mirror")
+        raise typer.Exit(code=0)
+
+    logger.info("mirroring {} repo(s) → {} (publish={})", len(repos), dataset, publish)
+    results = pipeline.mirror_all(
+        repos,
+        data_dir=data_dir,
+        dataset=dataset,
+        publish=publish,
+        keep_local=keep_local,
+        max_repo_size_mb=max_repo_size_mb,
+        token=token,
+        resume=resume,
+    )
+
+    by_status: dict[str, int] = {}
+    total_challenges = total_bytes = 0
+    for r in results:
+        by_status[r.status] = by_status.get(r.status, 0) + 1
+        total_challenges += r.n_challenges
+        total_bytes += r.bytes
+
+    typer.echo("mirror summary:")
+    typer.echo(f"  processed:   {len(results)}")
+    for status in ("ok", "failed", "skipped", "too_big"):
+        if by_status.get(status):
+            typer.echo(f"  {status:10} {by_status[status]}")
+    typer.echo(f"  challenges:  {total_challenges}")
+    typer.echo(f"  bytes:       {total_bytes}")
+
+
 if __name__ == "__main__":
     app()

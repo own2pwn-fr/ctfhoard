@@ -31,3 +31,8 @@ data/**/*.tmp
 # The whole materialized corpus lives under data/corpus/ locally and is published to
 # HF via `ctfhoard publish-hf`; it is NOT tracked on GitHub (would be hundreds of GB).
 data/corpus/
+
+# Operational state (regenerable): discovery list + mirror resume manifest + staging
+data/discovered_repos.jsonl
+data/mirror_state.jsonl
+data/staging/
