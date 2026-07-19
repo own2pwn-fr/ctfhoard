@@ -268,11 +268,15 @@ def archive_challenge(challenge_dir: Path) -> Path:
         ti.uname = ti.gname = ""
         return ti
 
+    # GNU format (not USTAR): USTAR caps member names at 100 chars, and real repos
+    # (e.g. google-ctf) have deeper/longer paths that raise "name is too long" and fail
+    # the whole repo. GNU handles arbitrary-length names and stays byte-deterministic
+    # with a fixed mtime (unlike PAX, which embeds atime/ctime headers).
     # gzip with mtime=0 and no fileobj filename → byte-stable header across re-runs.
     with (
         open(archive_path, "wb") as raw,
         gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz,
-        tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tar,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tar,
     ):
         for full, arcname in members:
             tar.add(full, arcname=arcname, recursive=False, filter=_reset)

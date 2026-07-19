@@ -480,3 +480,24 @@ def test_materialize_and_archive_repoints_corpus_path(tmp_path):
     with tarfile.open(archive, "r:gz") as tar:
         members = {m.name for m in tar.getmembers() if m.isfile()}
     assert {"chal.py", "Dockerfile", "writeups/writeup_00.md"} <= members
+
+
+def test_archive_challenge_handles_long_paths(tmp_path):
+    # Regression: USTAR caps member names at 100 chars; real repos (google-ctf) have
+    # deeper paths that raised "name is too long" and failed the whole repo. GNU_FORMAT
+    # must archive them and stay extractable.
+    from ctfhoard.corpus import archive_challenge
+
+    d = tmp_path / "chal__deadbeef"
+    deep = d / ("a" * 40) / ("b" * 40) / ("c" * 40)
+    deep.mkdir(parents=True)
+    (deep / "exploit.py").write_text("pwn\n")
+    (d / "chal.c").write_text("int main(){}\n")
+
+    arc = archive_challenge(d)  # must not raise
+    import tarfile
+
+    with tarfile.open(arc) as t:
+        names = t.getnames()
+    assert any(("c" * 40) in n for n in names)
+    assert not d.exists()  # loose dir removed
