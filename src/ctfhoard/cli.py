@@ -241,6 +241,9 @@ def mirror(
     max_repo_size_mb: int = typer.Option(
         4096, help="Cap (MB) on a discovered repo's size before cloning."
     ),
+    workers: int = typer.Option(
+        6, help="Parallel clone/materialize/archive producers (HF publish stays serial)."
+    ),
     batch_size: int = typer.Option(
         50, help="Publish once per this many staged repos (batches HF commits)."
     ),
@@ -254,13 +257,15 @@ def mirror(
 ) -> None:
     """Commit-batched mirror of many repos to the HF dataset, disk-bounded.
 
-    Repos are staged into a shared batch (clone → normalize → dedup → materialize hard
-    copies → delete the raw clone); once the batch reaches --batch-size repos or
-    --batch-max-mb on disk, the WHOLE batch is published in one corpus + one catalog
-    commit, then the staging tree is cleaned (unless --keep-local). This cuts HF commit
-    count ~50× (avoiding rate limits) while peak local disk stays bounded to one batch.
-    Resumable via ``data_dir/mirror_state.jsonl`` — a repo is 'ok' only after its batch
-    is published.
+    Repos are cloned → normalized → deduped → materialized (raw clone dropped) by up to
+    --workers parallel producers, each into its own isolated work dir; a single serial
+    consumer merges finished repos into one shared batch. Once the batch reaches
+    --batch-size repos or --batch-max-mb on disk, the WHOLE batch is published in one
+    corpus + one catalog commit (HF upload stays serial — it rate-limits commits), then
+    the staging tree is cleaned (unless --keep-local). This cuts HF commit count ~50×
+    while parallelizing the slow clone/materialize/archive across cores; peak local disk
+    stays bounded to ~--workers in-flight clones plus one batch. Resumable via
+    ``data_dir/mirror_state.jsonl`` — a repo is 'ok' only after its batch is published.
     """
     from ctfhoard import pipeline
 
@@ -285,6 +290,7 @@ def mirror(
         max_repo_size_mb=max_repo_size_mb,
         token=token,
         resume=resume,
+        workers=workers,
         batch_size=batch_size,
         batch_max_mb=batch_max_mb,
     )
