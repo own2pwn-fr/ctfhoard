@@ -1,0 +1,5 @@
+*.o
+checker
+/partychat*
+*.log
+histories/

@@ -134,7 +134,9 @@ def test_stage_repo_materializes_into_batch_and_drops_clone(
     assert result.repo == "acme/pwn"
     assert result.commit_sha == _SHA
     assert result.n_challenges == 1
-    assert result.n_files >= 2  # chal.py + Dockerfile copied in
+    # The challenge dir was packed into ONE per-challenge tarball, so the batch gains a
+    # single file (the archive), not the loose source tree.
+    assert result.n_files == 1
     assert result.bytes > 0
 
     # Raw clone dropped immediately; the shared batch staging is UNTOUCHED here.
@@ -144,9 +146,56 @@ def test_stage_repo_materializes_into_batch_and_drops_clone(
     shard = catalog_root / slug / "challenges.jsonl"
     assert shard.exists()
 
-    # The shard carries the HF-layout corpus_path (relative to staging_batch).
+    # The batch corpus holds per-challenge .tar.gz archives, NOT loose source files.
+    archives = list(corpus_root.rglob("*.tar.gz"))
+    assert len(archives) == 1
+    assert not list(corpus_root.rglob("chal.py"))  # no loose source tree remains
+    assert not list(corpus_root.rglob("Dockerfile"))
+
+    # The shard carries the HF-layout corpus_path (relative to staging_batch), now
+    # pointing at the archive.
     records = [json.loads(line) for line in shard.read_text().splitlines() if line]
-    assert records and records[0]["corpus_path"].startswith("corpus/")
+    assert records
+    assert records[0]["corpus_path"].startswith("corpus/")
+    assert records[0]["corpus_path"].endswith(".tar.gz")
+    # The per-file browsable manifest is preserved in the catalog.
+    assert {f["path"] for f in records[0]["files"]} >= {"chal.py", "Dockerfile"}
+
+
+def test_stage_repo_archives_one_tarball_per_challenge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    corpus_root, catalog_root = _batch_roots(data_dir)
+    # Two distinct challenges in one repo → two independent per-challenge tarballs.
+    # Give each unique source bytes so they don't fingerprint-collapse in dedup.
+    alpha = _make_raw(tmp_path, "acme/multi", "alpha")
+    (Path(alpha.local_dir) / "unique.txt").write_text("alpha marker\n", encoding="utf-8")
+    beta = _make_raw(tmp_path, "acme/multi", "beta")
+    (Path(beta.local_dir) / "unique.txt").write_text("beta marker\n", encoding="utf-8")
+    _patch_discover(monkeypatch, [alpha, beta])
+
+    result = pipeline.stage_repo(
+        "acme/multi",
+        data_dir=data_dir,
+        batch_corpus_root=corpus_root,
+        batch_catalog_root=catalog_root,
+        max_repo_size_mb=4096,
+        token="t",
+    )
+
+    assert result.status == "staged"
+    assert result.n_challenges == 2
+    # One .tar.gz per challenge; no loose source trees left in staging.
+    archives = list(corpus_root.rglob("*.tar.gz"))
+    assert len(archives) == 2
+    assert not list(corpus_root.rglob("chal.py"))
+
+    # Every catalog record's corpus_path points at a .tar.gz archive.
+    shard = catalog_root / "acme__multi" / "challenges.jsonl"
+    records = [json.loads(line) for line in shard.read_text().splitlines() if line]
+    assert len(records) == 2
+    assert all(r["corpus_path"].endswith(".tar.gz") for r in records)
 
 
 def test_mirror_all_flushes_by_count(

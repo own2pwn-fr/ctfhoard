@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 
 from ctfhoard import hf
 from ctfhoard.connectors.git_repo import GitRepoConnector
-from ctfhoard.corpus import materialize_challenge
+from ctfhoard.corpus import materialize_and_archive
 from ctfhoard.dedup import cluster_by_fingerprint, merge_cluster
 from ctfhoard.discover import load_discovered
 from ctfhoard.mirror import _repo_dirname
@@ -227,8 +227,12 @@ def stage_repo(
                 else None
             )
             # client=None: repo writeups are in-repo files copied with the sources; no
-            # external link is followed here.
-            materialize_challenge(
+            # external link is followed here. materialize_and_archive materializes the
+            # loose tree (keeping the browsable per-file manifest) then packs the whole
+            # challenge dir into ONE .tar.gz — collapsing millions of tiny source files
+            # into ~one tarball per challenge so HF's per-file upload rate limit becomes
+            # tractable. corpus_path ends up pointing at the archive.
+            materialize_and_archive(
                 ch, batch_corpus_root, raw_dir=raw_dir, client=None, repo_root=repo_root
             )
 

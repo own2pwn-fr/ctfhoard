@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Create</title>
+    <link href="/static/css/bootstrap.min.css" rel="stylesheet">
+    <link href="/static/css/main.css" rel="stylesheet">
+    <script src="/static/js/jquery.min.js"></script>
+    <script src="/static/js/bootstrap.min.js"></script>
+    <script src="/static/js/main.js"></script>
+</head>
+
+<body>
+
+<nav class="navbar navbar-expand-md navbar-dark fixed-top bg-dark">
+    <div class="collapse navbar-collapse" id="navbarsExampleDefault">
+        <ul class="navbar-nav mr-auto">
+            <li class="nav-item">
+                <a class="nav-link" href="/main">Home</a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link active" href="/create_page">Create a new label</a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="/listing">My labels</a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="/phrase">My secret phrase</a>
+            </li>
+        </ul>
+        <nav class="navbar navbar-dark bg-dark">
+                <span class="navbar-text">
+                    Hello, {{ .Login }}!
+                </span>
+        </nav>
+        <a class="btn btn-outline-success my-2 my-sm-0" role="button" href="/logout">Log Out</a>
+    </div>
+</nav>
+
+<main role="main" class="wrapper">
+    <div class="container form-top">
+        <div class="row h-100">
+            <div class="col-sm-3"></div>
+            <div class="col-sm-6 my-auto">
+                <label>Text</label>
+                <div class="form-group">
+                    <input type="text" class="form-control" placeholder="text" value="Example" id="t-fld">
+                    <span class="help-block text-danger" id="t-err"></span>
+                </div>
+                <label>Font</label>
+                <div class="form-group">
+                    <input type="text" class="form-control" placeholder="font" value="Arial" id="f-fld">
+                    <span class="help-block text-danger" id="f-err"></span>
+                </div>
+                <label>Size</label>
+                <div class="form-group">
+                    <input type="number" class="form-control" placeholder="size" value="20" min="10" max="90" id="s-fld">
+                    <span class="help-block text-danger" id="s-err"></span>
+                </div>
+                <button type="submit" class="btn btn-primary" onclick="createLabel()">Create</button>
+            </div>
+        </div>
+    </div>
+</main>
+</body>
+</html>
