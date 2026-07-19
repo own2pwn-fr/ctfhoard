@@ -8,11 +8,17 @@ service is touched.
 from __future__ import annotations
 
 import socket
+import tarfile
 
 import pytest
 
 from ctfhoard import netguard
-from ctfhoard.corpus import challenge_relpath, materialize_challenge
+from ctfhoard.corpus import (
+    archive_challenge,
+    challenge_relpath,
+    materialize_and_archive,
+    materialize_challenge,
+)
 from ctfhoard.netguard import UnsafeUrlError, is_public_http_url, safe_get
 from ctfhoard.schema import Challenge, FileEntry, Origin, Source, Writeup
 
@@ -390,3 +396,87 @@ def test_materialize_survives_symlinked_dir_in_sources(tmp_path):
     assert (dest / "solution" / "sploit.py").exists()
     # the symlinked dir itself is not copied/traversed as a real directory
     assert not (dest / "exploit").is_dir()
+
+
+# --------------------------------------------------------------------------
+# Per-challenge archiving: pack each materialized challenge dir into ONE
+# deterministic .tar.gz (HF per-file upload rate limit workaround).
+# --------------------------------------------------------------------------
+
+
+def _build_challenge_dir(root):
+    """A small fake materialized challenge tree (nested dirs + a writeup)."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "chal.py").write_text("print('pwn')\n")
+    (root / "Dockerfile").write_text("FROM scratch\n")
+    (root / "src").mkdir()
+    (root / "src" / "helper.c").write_text("int main(){}\n")
+    (root / "writeups").mkdir()
+    (root / "writeups" / "writeup_00.md").write_text("# Solution\nbody\n")
+
+
+def test_archive_challenge_packs_and_removes_loose_dir(tmp_path):
+    cdir = tmp_path / "chal__deadbeef"
+    _build_challenge_dir(cdir)
+
+    archive = archive_challenge(cdir)
+
+    # A single .tar.gz remains; the loose dir is gone.
+    assert archive == tmp_path / "chal__deadbeef.tar.gz"
+    assert archive.exists()
+    assert not cdir.exists()
+
+    # Extracting reproduces the exact tree at paths relative to the challenge dir.
+    extract = tmp_path / "extract"
+    with tarfile.open(archive, "r:gz") as tar:
+        names = sorted(m.name for m in tar.getmembers() if m.isfile())
+        tar.extractall(extract, filter="data")
+    assert names == [
+        "Dockerfile",
+        "chal.py",
+        "src/helper.c",
+        "writeups/writeup_00.md",
+    ]
+    assert (extract / "chal.py").read_text() == "print('pwn')\n"
+    assert (extract / "src" / "helper.c").read_text() == "int main(){}\n"
+    assert (extract / "writeups" / "writeup_00.md").read_text().startswith("# Solution")
+
+
+def test_archive_challenge_is_byte_deterministic(tmp_path):
+    # Two identical challenge trees must archive to byte-identical tarballs so HF
+    # diffing skips unchanged challenges on re-runs.
+    a = tmp_path / "a" / "chal__cafe"
+    b = tmp_path / "b" / "chal__cafe"
+    _build_challenge_dir(a)
+    _build_challenge_dir(b)
+
+    arc_a = archive_challenge(a)
+    arc_b = archive_challenge(b)
+
+    assert arc_a.read_bytes() == arc_b.read_bytes()
+
+
+def test_materialize_and_archive_repoints_corpus_path(tmp_path):
+    raw = tmp_path / "raw"
+    ch = _challenge_with_sources(raw)
+    corpus = tmp_path / "corpus"
+
+    materialize_and_archive(ch, corpus, raw_dir=raw, client=_FakeClient(), repo_root=tmp_path)
+
+    # The loose challenge dir was replaced by one tarball; corpus_path points at it.
+    dest = corpus / challenge_relpath(ch)
+    archive = dest.with_name(dest.name + ".tar.gz")
+    assert not dest.exists()
+    assert archive.exists()
+    assert ch.corpus_path is not None
+    assert ch.corpus_path.endswith(".tar.gz")
+    assert ch.corpus_path == str(archive.relative_to(tmp_path))
+
+    # The per-file browsable manifest (sources + writeups) is preserved in the catalog.
+    paths = {f.path for f in ch.files}
+    assert {"chal.py", "Dockerfile", "writeups/writeup_00.md"} <= paths
+
+    # The archive is independently extractable and contains the writeup bytes.
+    with tarfile.open(archive, "r:gz") as tar:
+        members = {m.name for m in tar.getmembers() if m.isfile()}
+    assert {"chal.py", "Dockerfile", "writeups/writeup_00.md"} <= members

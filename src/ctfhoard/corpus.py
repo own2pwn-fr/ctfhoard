@@ -14,9 +14,11 @@ challenge or its sources.
 
 from __future__ import annotations
 
+import gzip
 import os
 import re
 import shutil
+import tarfile
 from pathlib import Path
 
 from loguru import logger
@@ -223,3 +225,95 @@ def _prune_writeups(wdir: Path, kept: set[str]) -> None:
     for existing in wdir.iterdir():
         if existing.is_file() and existing.name not in kept:
             existing.unlink()
+
+
+def archive_challenge(challenge_dir: Path) -> Path:
+    """Pack one materialized challenge dir into a single deterministic ``.tar.gz``.
+
+    Hugging Face rate-limits per-file uploads (~5-11 files/s regardless of bandwidth or
+    Xet/LFS), so publishing the corpus one loose source file at a time is infeasible at
+    the scale of millions of tiny files. Collapsing EACH challenge into one tarball cuts
+    the file count ~1000× (millions of sources → tens of thousands of per-challenge
+    archives), which is tractable. Each archive is self-contained and independently
+    extractable — its members are the challenge dir's contents at paths *relative* to the
+    challenge dir (writeups included, since they already live under it), so extracting
+    reproduces the challenge tree.
+
+    Determinism: members are added in sorted order with a fixed ``mtime=0`` and zeroed
+    owner metadata, and gzip is written with ``mtime=0`` (no embedded timestamp/filename),
+    so re-archiving byte-identical content yields a byte-identical tarball. HF then diffs
+    it away and skips re-uploading unchanged challenges.
+
+    The loose challenge dir is removed after archiving, leaving only ``<dir>.tar.gz`` in
+    staging. Returns the archive path.
+    """
+    challenge_dir = Path(challenge_dir)
+    archive_path = challenge_dir.with_name(challenge_dir.name + ".tar.gz")
+
+    # Gather regular files only, at paths relative to the challenge dir, sorted for a
+    # stable member order. os.walk does not follow symlinks; _copy_sources already
+    # refused symlinked sources, so the tree is plain files/dirs.
+    members: list[tuple[Path, str]] = []
+    for dirpath, dirnames, filenames in os.walk(challenge_dir):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            full = Path(dirpath) / fn
+            arcname = full.relative_to(challenge_dir).as_posix()
+            members.append((full, arcname))
+    members.sort(key=lambda t: t[1])
+
+    def _reset(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+        ti.mtime = 0
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        return ti
+
+    # gzip with mtime=0 and no fileobj filename → byte-stable header across re-runs.
+    with (
+        open(archive_path, "wb") as raw,
+        gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tar,
+    ):
+        for full, arcname in members:
+            tar.add(full, arcname=arcname, recursive=False, filter=_reset)
+
+    shutil.rmtree(challenge_dir)
+    return archive_path
+
+
+def materialize_and_archive(
+    challenge: Challenge,
+    corpus_root: Path,
+    *,
+    raw_dir: Path | None = None,
+    client: PoliteClient | None = None,
+    repo_root: Path | None = None,
+) -> Challenge:
+    """Materialize a challenge, then pack its dir into one per-challenge ``.tar.gz``.
+
+    Layers per-challenge archiving on top of :func:`materialize_challenge`: the loose
+    challenge tree is written first (so the browsable per-file ``files`` manifest is still
+    computed exactly as before), then the whole dir is replaced by a single deterministic
+    ``<slug>__id.tar.gz`` via :func:`archive_challenge`. Only ``corpus_path`` changes — it
+    is repointed at the archive (e.g. ``corpus/<origin>/<event>/<year>/<slug>__id.tar.gz``,
+    repo-relative when ``repo_root`` is known); the per-file ``files`` index is preserved.
+
+    This is what makes the HF publish tractable: a batch of N repos then stages roughly
+    one tarball per challenge instead of the challenges' millions of loose source files,
+    and each archive remains independently extractable.
+    """
+    materialize_challenge(
+        challenge, corpus_root, raw_dir=raw_dir, client=client, repo_root=repo_root
+    )
+    dest = corpus_root / challenge_relpath(challenge)
+    archive = archive_challenge(dest)
+    if repo_root is not None:
+        try:
+            challenge.corpus_path = str(
+                archive.resolve().relative_to(Path(repo_root).resolve())
+            )
+        except ValueError:
+            challenge.corpus_path = str(archive)
+    else:
+        challenge.corpus_path = str(archive)
+    return challenge
