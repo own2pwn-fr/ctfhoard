@@ -29,12 +29,28 @@ Two invariants make this safe and resumable:
 
 Every per-repo body is wrapped so a clone timeout, walk error, or publish failure is
 recorded as a failed :class:`RepoResult` and NEVER aborts the surrounding loop.
+
+Parallelism (producer/consumer)
+-------------------------------
+The slow part — per-repo clone + walk + materialize + archive (I/O plus gzip CPU) — is
+run concurrently across a :class:`~concurrent.futures.ThreadPoolExecutor`, while the
+batching + HF publish stay serial. :func:`stage_repo_isolated` is the *producer*: each
+call clones into its own ``raw/<slug>`` dir and materializes into its own
+``work/<slug>`` dir, sharing NO mutable state — so threads are safe with no locks (git
+clone is a subprocess and gzip releases the GIL, giving real parallelism). A SINGLE
+*consumer* (the main thread draining ``as_completed``) then moves each finished work dir
+into the one shared batch tree and does all batching/flushing/manifest writes serially,
+preserving the resume + ok-only-after-publish invariants exactly. HF upload stays serial
+(one commit per batch) because HF rate-limits commits regardless. Peak local disk is
+bounded to roughly ``workers`` in-flight clones/work dirs plus one accumulating batch.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -134,59 +150,76 @@ def _discovered_size_kb(data_dir: Path, repo: str) -> int | None:
     return None
 
 
-def stage_repo(
+def stage_repo_isolated(
     repo: str,
     *,
     data_dir: Path,
-    batch_corpus_root: Path,
-    batch_catalog_root: Path,
+    work_root: Path,
     max_repo_size_mb: int,
     token: str | None,
     discovered_path: Path | None = None,
-) -> RepoResult:
-    """Clone one repo and materialize it INTO the current shared batch (no publish).
+) -> tuple[RepoResult, Path | None]:
+    """Clone + materialize + archive ONE repo into its OWN isolated work dir (no publish).
 
-    Clones ``repo`` under ``data_dir/raw``, walks/normalizes/dedups it, materializes
-    hard copies into the SHARED ``batch_corpus_root`` (whose layout matches the HF
-    dataset), writes the repo's catalog shard under ``batch_catalog_root/<slug>``, then
-    ALWAYS deletes the raw clone — even on failure — so disk stays bounded to the
-    materialized batch alone. It does NOT publish and does NOT touch the shared batch
-    staging (the caller flushes the whole batch later).
+    This is the parallelizable *producer*: it shares NO mutable state with any other
+    concurrent call, so many of them can run on a thread pool with no locks. It clones
+    ``repo`` into ``data_dir/raw/<slug>`` (a unique per-repo clone dir), walks /
+    normalizes / dedups it, materializes+archives its challenges into
+    ``work_root/<slug>/corpus/...`` and writes the repo's catalog shard to
+    ``work_root/<slug>/catalog/<slug>/challenges.jsonl``. Using ``repo_root =
+    work_root/<slug>`` keeps each challenge's stored ``corpus_path`` at the HF-relative
+    ``corpus/<origin>/<event>/<year>/<slug>__id.tar.gz`` (identical to the old shared-batch
+    layout). The raw clone is ALWAYS deleted (``finally``) so a single producer holds at
+    most one clone plus one materialized work dir at a time.
 
-    Never raises: a clone timeout, walk error or any other exception becomes a
-    ``failed`` :class:`RepoResult` so the caller's loop continues. A successful stage
-    returns status ``staged`` (materialized-into-batch, not yet published); the
-    disk-guard floor yields ``skipped`` and the size cap yields ``too_big``, both
-    before any clone.
+    Thread-safety: git clone runs as a subprocess (releases the GIL) and gzip releases
+    the GIL for its C compression, so concurrent producers get real I/O + CPU parallelism;
+    the per-repo ``raw/<slug>`` and ``work_root/<slug>`` paths are disjoint, so no two
+    producers ever touch the same bytes.
+
+    Never raises. Returns ``(result, work_dir)`` where ``work_dir`` is the populated
+    ``work_root/<slug>`` and ``result.status == 'staged'`` on success; otherwise
+    ``(result, None)`` with status ``skipped`` (disk floor), ``too_big`` (size cap) or
+    ``failed`` (anything raised while staging — the partial work dir is cleaned up here).
+    The single consumer later merges ``work_dir``'s subtrees into the shared batch and
+    deletes it.
     """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    batch_corpus_root = Path(batch_corpus_root)
-    batch_catalog_root = Path(batch_catalog_root)
+    work_root = Path(work_root)
 
     slug = _repo_dirname(repo)
     raw_workdir = data_dir / "raw"
     clone_dir = raw_workdir / slug
+    work_dir = work_root / slug
+    corpus_root = work_dir / "corpus"
+    catalog_root = work_dir / "catalog"
 
     # Disk guard: refuse to start a clone that could exhaust the disk mid-run.
     free = shutil.disk_usage(data_dir).free
     if free < _MIN_FREE_BYTES:
-        return RepoResult(
-            repo=repo,
-            status="skipped",
-            error=(
-                f"low disk: {free / 1024**3:.1f} GiB free below "
-                f"{_MIN_FREE_BYTES / 1024**3:.0f} GiB floor"
+        return (
+            RepoResult(
+                repo=repo,
+                status="skipped",
+                error=(
+                    f"low disk: {free / 1024**3:.1f} GiB free below "
+                    f"{_MIN_FREE_BYTES / 1024**3:.0f} GiB floor"
+                ),
             ),
+            None,
         )
 
     # Cheap size pre-check for open-endedly discovered repos (seeds are never capped).
     size_kb = _discovered_size_kb(data_dir, repo)
     if size_kb is not None and size_kb > max_repo_size_mb * 1024:
-        return RepoResult(
-            repo=repo,
-            status="too_big",
-            error=f"{size_kb} KB exceeds {max_repo_size_mb} MB cap",
+        return (
+            RepoResult(
+                repo=repo,
+                status="too_big",
+                error=f"{size_kb} KB exceeds {max_repo_size_mb} MB cap",
+            ),
+            None,
         )
 
     commit_sha: str | None = None
@@ -211,15 +244,10 @@ def stage_repo(
         challenges = _dedup(challenges)
         commit_sha = _commit_sha_of(challenges)
 
-        # Measure the batch corpus before/after so this repo's own file/byte
-        # contribution can be reported (the batch tree is shared and accumulates).
-        before = hf.corpus_stats(batch_corpus_root)
-
-        # Materialize each challenge into the SHARED batch corpus. Using
-        # repo_root=batch_corpus_root.parent (= staging_batch) makes corpus_path come
-        # out as 'corpus/<origin>/...', the exact HF layout, while all batch bytes stay
-        # under one deletable directory.
-        repo_root = batch_corpus_root.parent.resolve()
+        # Materialize each challenge into this repo's OWN corpus tree. Using
+        # repo_root=work_dir makes corpus_path come out as 'corpus/<origin>/...', the
+        # exact HF layout, while every byte stays under one deletable per-repo dir.
+        repo_root = work_dir.resolve()
         for ch in challenges:
             raw_dir = (
                 Path(ch.corpus_path)
@@ -233,37 +261,68 @@ def stage_repo(
             # into ~one tarball per challenge so HF's per-file upload rate limit becomes
             # tractable. corpus_path ends up pointing at the archive.
             materialize_and_archive(
-                ch, batch_corpus_root, raw_dir=raw_dir, client=None, repo_root=repo_root
+                ch, corpus_root, raw_dir=raw_dir, client=None, repo_root=repo_root
             )
 
-        after = hf.corpus_stats(batch_corpus_root)
+        # The corpus tree is fresh per repo, so its whole size is this repo's own
+        # file/byte contribution to the eventual batch.
+        stats = hf.corpus_stats(corpus_root)
 
-        # Write this repo's catalog shard into the shared batch catalog tree.
-        writer = CatalogWriter(batch_catalog_root / slug)
+        # Write this repo's catalog shard under its own work dir.
+        writer = CatalogWriter(catalog_root / slug)
         writer.extend(challenges)
         writer.write_jsonl()
 
-        return RepoResult(
-            repo=repo,
-            commit_sha=commit_sha,
-            n_challenges=len(challenges),
-            n_files=after["files"] - before["files"],
-            bytes=after["total_bytes"] - before["total_bytes"],
-            status="staged",
+        return (
+            RepoResult(
+                repo=repo,
+                commit_sha=commit_sha,
+                n_challenges=len(challenges),
+                n_files=stats["files"],
+                bytes=stats["total_bytes"],
+                status="staged",
+            ),
+            work_dir,
         )
     except Exception as exc:  # noqa: BLE001 — one bad repo must never abort the run
-        logger.warning("stage_repo {} failed: {}", repo, exc)
-        return RepoResult(
-            repo=repo,
-            commit_sha=commit_sha,
-            status="failed",
-            error=f"{type(exc).__name__}: {exc}",
+        logger.warning("stage_repo_isolated {} failed: {}", repo, exc)
+        # Drop any partial materialized work dir so a failure leaves nothing behind.
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return (
+            RepoResult(
+                repo=repo,
+                commit_sha=commit_sha,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+            None,
         )
     finally:
-        # ALWAYS free the raw clone immediately: the materialized copy in the batch is
-        # smaller, so dropping the clone keeps peak disk bounded to one batch. The
-        # shared batch staging is NEVER touched here — the caller flushes it.
+        # ALWAYS free the raw clone immediately: the materialized copy is smaller, so
+        # dropping the clone keeps peak disk bounded. The shared batch staging is NEVER
+        # touched here — the consumer merges this work dir into it and flushes.
         shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _merge_move(src_root: Path, dst_root: Path) -> None:
+    """Move every file under ``src_root`` into ``dst_root`` at the same relative path.
+
+    ``shutil.move`` cannot merge a directory into an existing one, but two different
+    repos can legitimately share a ``corpus/<origin>/<event>/<year>/`` prefix in the
+    shared batch, so the consumer merges trees file-by-file. Both roots live under the
+    same ``data_dir`` filesystem, so :func:`os.replace` is an atomic rename (no copy).
+    A no-op when ``src_root`` is absent.
+    """
+    src_root = Path(src_root)
+    if not src_root.exists():
+        return
+    dst_root = Path(dst_root)
+    for dirpath, _dirnames, filenames in os.walk(src_root):
+        rel = Path(dirpath).relative_to(src_root)
+        target_dir = dst_root / rel
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for fn in filenames:
+            os.replace(Path(dirpath) / fn, target_dir / fn)
 
 
 def _load_done_ok(manifest: Path) -> set[str]:
@@ -392,22 +451,34 @@ def mirror_all(
     max_repo_size_mb: int,
     token: str | None,
     resume: bool,
+    workers: int = 6,
     batch_size: int = 50,
-    batch_max_mb: int = 15000,
+    batch_max_mb: int = 8000,
 ) -> list[RepoResult]:
-    """Mirror many repos in commit-batches, disk-bounded and resumable.
+    """Mirror many repos in commit-batches — parallel producers, one serial consumer.
 
     Loads the resume manifest at ``data_dir/mirror_state.jsonl``; when ``resume`` is set,
-    repos already recorded ``ok`` are skipped. Each remaining repo is staged into a
-    shared batch by :func:`stage_repo`; once the batch reaches ``batch_size`` staged
-    repos OR ``batch_max_mb`` MB on disk, :func:`_flush_batch` publishes the whole batch
-    in one corpus + one catalog commit and marks its repos ``ok``. Any remaining staged
-    repos are flushed at the end.
+    repos already recorded ``ok`` are skipped. The remaining repos are cloned +
+    materialized + archived CONCURRENTLY by up to ``workers`` :func:`stage_repo_isolated`
+    producers on a :class:`~concurrent.futures.ThreadPoolExecutor`, each into its own
+    isolated ``data_dir/work/<slug>`` dir (no shared state, no locks — see that function).
 
-    Resume correctness: a repo is recorded ``ok`` ONLY after its batch is published to
-    HF. If the process dies mid-batch (before a flush), those repos are never ``ok`` and
-    get redone next run — no gaps, no double publishing. Non-staged outcomes
-    (``failed``/``skipped``/``too_big``) are recorded as-is immediately. Returns every
+    A SINGLE consumer (this function's main thread, draining ``as_completed``) does all
+    the serial, order-independent work: for each finished producer it either records a
+    non-``staged`` outcome (``failed``/``skipped``/``too_big``) to the manifest
+    immediately, or MOVES the staged work dir's ``corpus``/``catalog`` subtrees into the
+    one shared batch tree (``data_dir/staging_batch``) and appends the repo to the current
+    batch. Once the batch reaches ``batch_size`` repos OR ``batch_max_mb`` MB on disk,
+    :func:`_flush_batch` publishes the whole batch in one corpus + one catalog commit and
+    marks its repos ``ok``. Any remaining staged repos are flushed at the end. Because only
+    the consumer ever touches the batch + manifest, no locks are needed there.
+
+    Resume correctness (unchanged by parallelism): a repo is recorded ``ok`` ONLY after
+    its batch is published to HF. If the process dies mid-batch (before a flush), those
+    repos are never ``ok`` and get redone next run — no gaps, no double publishing.
+
+    Peak local disk is bounded to roughly ``workers`` in-flight clones/work dirs plus one
+    accumulating batch, so ``workers`` also caps the disk high-water mark. Returns every
     result actually processed here (already-``ok`` skips are not re-emitted).
     """
     data_dir = Path(data_dir)
@@ -417,17 +488,24 @@ def mirror_all(
     staging_batch = data_dir / "staging_batch"
     batch_corpus_root = staging_batch / "corpus"
     batch_catalog_root = staging_batch / "catalog"
+    work_root = data_dir / "work"
     discovered_path = data_dir / "discovered_repos.jsonl"
 
-    # A leftover staging tree from a crashed run is UNPUBLISHED (its repos are not 'ok'):
-    # drop it so the first batch starts clean; those repos are re-staged from scratch.
+    # Leftover staging/work trees from a crashed run are UNPUBLISHED (their repos are not
+    # 'ok'): drop them so the first batch starts clean; those repos are re-staged.
     shutil.rmtree(staging_batch, ignore_errors=True)
+    shutil.rmtree(work_root, ignore_errors=True)
 
     done_ok = _load_done_ok(manifest) if resume else set()
+    pending = [r for r in repos if not (resume and r in done_ok)]
+    skipped = len(repos) - len(pending)
+    if skipped:
+        logger.info("resume: skipping {} repo(s) already 'ok'", skipped)
+
     results: list[RepoResult] = []
     batch_staged: list[RepoResult] = []
     batch_bytes = 0
-    total = len(repos)
+    total = len(pending)
 
     def _flush() -> None:
         nonlocal batch_staged, batch_bytes
@@ -446,45 +524,60 @@ def mirror_all(
         batch_staged = []
         batch_bytes = 0
 
-    for i, repo in enumerate(repos, start=1):
-        if resume and repo in done_ok:
-            logger.info("[{}/{}] {} → skip (already ok)", i, total, repo)
-            continue
+    # Producers: submit every pending repo; the executor caps concurrency at ``workers``,
+    # so at most ``workers`` clones/work dirs exist at once (the disk bound).
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {
+            pool.submit(
+                stage_repo_isolated,
+                repo,
+                data_dir=data_dir,
+                work_root=work_root,
+                max_repo_size_mb=max_repo_size_mb,
+                token=token,
+                discovered_path=discovered_path,
+            ): repo
+            for repo in pending
+        }
 
-        result = stage_repo(
-            repo,
-            data_dir=data_dir,
-            batch_corpus_root=batch_corpus_root,
-            batch_catalog_root=batch_catalog_root,
-            max_repo_size_mb=max_repo_size_mb,
-            token=token,
-            discovered_path=discovered_path,
-        )
+        # Consumer: a single thread drains completions in whatever order they finish and
+        # does ALL batching/flushing/manifest writes serially, so no locks are needed.
+        for i, future in enumerate(as_completed(futures), start=1):
+            repo = futures[future]
+            result, work_dir = future.result()  # stage_repo_isolated never raises
 
-        free = shutil.disk_usage(data_dir).free
-        logger.info(
-            "[{}/{}] {} → {} ({} ch, {:.1f} MB, free disk {:.1f} GB)",
-            i,
-            total,
-            repo,
-            result.status,
-            result.n_challenges,
-            result.bytes / 1024**2,
-            free / 1024**3,
-        )
+            free = shutil.disk_usage(data_dir).free
+            logger.info(
+                "[{}/{}] {} → {} ({} ch, {:.1f} MB, free disk {:.1f} GB)",
+                i,
+                total,
+                repo,
+                result.status,
+                result.n_challenges,
+                result.bytes / 1024**2,
+                free / 1024**3,
+            )
 
-        if result.status == "staged":
-            batch_staged.append(result)
-            batch_bytes += result.bytes
-            if len(batch_staged) >= batch_size or batch_bytes >= batch_max_mb * 1024**2:
-                _flush()
-        else:
-            # failed / skipped / too_big are terminal for this run: record as-is now.
-            _append_manifest(manifest, result, ts=datetime.now(UTC))
-            results.append(result)
+            if result.status == "staged" and work_dir is not None:
+                # Merge this repo's isolated output into the ONE shared batch tree, then
+                # drop the emptied work dir. Only the consumer touches the batch.
+                _merge_move(work_dir / "corpus", batch_corpus_root)
+                _merge_move(work_dir / "catalog", batch_catalog_root)
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+                batch_staged.append(result)
+                batch_bytes += result.bytes
+                if len(batch_staged) >= batch_size or batch_bytes >= batch_max_mb * 1024**2:
+                    _flush()
+            else:
+                # failed / skipped / too_big are terminal for this run: record as-is now.
+                _append_manifest(manifest, result, ts=datetime.now(UTC))
+                results.append(result)
 
     # Final flush of any repos staged since the last flush.
     _flush()
+    # The work root should be empty now (every work dir was merged or cleaned); drop it.
+    shutil.rmtree(work_root, ignore_errors=True)
     return results
 
 

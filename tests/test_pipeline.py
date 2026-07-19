@@ -107,24 +107,17 @@ def _patch_discover_by_repo(
     monkeypatch.setattr(GitRepoConnector, "discover", _discover)
 
 
-def _batch_roots(data_dir: Path) -> tuple[Path, Path]:
-    """The shared batch corpus/catalog roots mirror_all uses."""
-    staging = data_dir / "staging_batch"
-    return staging / "corpus", staging / "catalog"
-
-
-def test_stage_repo_materializes_into_batch_and_drops_clone(
+def test_stage_repo_isolated_materializes_and_drops_clone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
-    corpus_root, catalog_root = _batch_roots(data_dir)
+    work_root = data_dir / "work"
     _patch_discover(monkeypatch, [_make_raw(tmp_path, "acme/pwn", "target_practice")])
 
-    result = pipeline.stage_repo(
+    result, work_dir = pipeline.stage_repo_isolated(
         "acme/pwn",
         data_dir=data_dir,
-        batch_corpus_root=corpus_root,
-        batch_catalog_root=catalog_root,
+        work_root=work_root,
         max_repo_size_mb=4096,
         token="t",
     )
@@ -134,13 +127,18 @@ def test_stage_repo_materializes_into_batch_and_drops_clone(
     assert result.repo == "acme/pwn"
     assert result.commit_sha == _SHA
     assert result.n_challenges == 1
-    # The challenge dir was packed into ONE per-challenge tarball, so the batch gains a
-    # single file (the archive), not the loose source tree.
+    # The challenge dir was packed into ONE per-challenge tarball, so this repo's own
+    # corpus holds a single file (the archive), not the loose source tree.
     assert result.n_files == 1
     assert result.bytes > 0
 
-    # Raw clone dropped immediately; the shared batch staging is UNTOUCHED here.
+    # The isolated work dir is returned; corpus/catalog live under it.
     slug = "acme__pwn"
+    assert work_dir == work_root / slug
+    corpus_root = work_dir / "corpus"
+    catalog_root = work_dir / "catalog"
+
+    # Raw clone dropped immediately; the per-repo work dir holds the materialized output.
     assert not (data_dir / "raw" / slug).exists()
     assert corpus_root.exists()
     shard = catalog_root / slug / "challenges.jsonl"
@@ -166,7 +164,7 @@ def test_stage_repo_archives_one_tarball_per_challenge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
-    corpus_root, catalog_root = _batch_roots(data_dir)
+    work_root = data_dir / "work"
     # Two distinct challenges in one repo → two independent per-challenge tarballs.
     # Give each unique source bytes so they don't fingerprint-collapse in dedup.
     alpha = _make_raw(tmp_path, "acme/multi", "alpha")
@@ -175,14 +173,15 @@ def test_stage_repo_archives_one_tarball_per_challenge(
     (Path(beta.local_dir) / "unique.txt").write_text("beta marker\n", encoding="utf-8")
     _patch_discover(monkeypatch, [alpha, beta])
 
-    result = pipeline.stage_repo(
+    result, work_dir = pipeline.stage_repo_isolated(
         "acme/multi",
         data_dir=data_dir,
-        batch_corpus_root=corpus_root,
-        batch_catalog_root=catalog_root,
+        work_root=work_root,
         max_repo_size_mb=4096,
         token="t",
     )
+    corpus_root = work_dir / "corpus"
+    catalog_root = work_dir / "catalog"
 
     assert result.status == "staged"
     assert result.n_challenges == 2
@@ -232,20 +231,22 @@ def test_mirror_all_flushes_by_count(
     assert recorder.catalog_calls[0]["n_shards"] == 2
     assert recorder.catalog_calls[1]["n_shards"] == 1
 
-    # Every repo recorded 'ok' — but only after its batch was published.
-    assert [r.status for r in results] == ["ok", "ok", "ok"]
+    # Every repo recorded 'ok' — but only after its batch was published. Producers run
+    # in parallel so completion order is not fixed; assert on sets, not sequence.
+    assert all(r.status == "ok" for r in results)
     assert {r.repo for r in results} == {"acme/a", "acme/b", "acme/c"}
 
-    # Staging cleaned after the final flush.
+    # Staging cleaned after the final flush; the work root is gone too.
     assert not staging_batch.exists()
-    # Manifest durably records all three as ok.
+    assert not (data_dir / "work").exists()
+    # Manifest durably records all three as ok (order depends on completion timing).
     manifest = data_dir / "mirror_state.jsonl"
     recs = [json.loads(x) for x in manifest.read_text().splitlines() if x]
-    assert [(r["repo"], r["status"]) for r in recs] == [
+    assert {(r["repo"], r["status"]) for r in recs} == {
         ("acme/a", "ok"),
         ("acme/b", "ok"),
         ("acme/c", "ok"),
-    ]
+    }
 
 
 def test_mirror_all_records_ok_only_after_publish(
@@ -264,7 +265,9 @@ def test_mirror_all_records_ok_only_after_publish(
         },
     )
 
-    # batch_size=1 → one flush per repo: first flush raises, second succeeds.
+    # batch_size=1 → one flush per repo: first flush raises, second succeeds. workers=1
+    # pins completion order to submission order so "first flush = acme/a" is deterministic
+    # (the ok-only-after-publish invariant itself holds at any concurrency).
     results = pipeline.mirror_all(
         ["acme/a", "acme/b"],
         data_dir=data_dir,
@@ -274,6 +277,7 @@ def test_mirror_all_records_ok_only_after_publish(
         max_repo_size_mb=4096,
         token="t",
         resume=False,
+        workers=1,
         batch_size=1,
     )
 
@@ -420,7 +424,7 @@ def test_stage_repo_disk_guard_skips(
     from collections import namedtuple
 
     data_dir = tmp_path / "data"
-    corpus_root, catalog_root = _batch_roots(data_dir)
+    work_root = data_dir / "work"
     _patch_discover(monkeypatch, [_make_raw(tmp_path, "acme/big", "chal")])
 
     usage = namedtuple("Usage", "total used free")
@@ -428,20 +432,67 @@ def test_stage_repo_disk_guard_skips(
         pipeline.shutil, "disk_usage", lambda _p: usage(100, 99, 1 * 1024**3)
     )
 
-    result = pipeline.stage_repo(
+    result, work_dir = pipeline.stage_repo_isolated(
         "acme/big",
         data_dir=data_dir,
-        batch_corpus_root=corpus_root,
-        batch_catalog_root=catalog_root,
+        work_root=work_root,
         max_repo_size_mb=4096,
         token="t",
     )
 
     assert result.status == "skipped"
+    assert work_dir is None
     assert result.error and "low disk" in result.error
     # Guard fired before any clone/materialize.
     assert not (data_dir / "raw" / "acme__big").exists()
-    assert not corpus_root.exists()
+    assert not (work_root / "acme__big").exists()
+
+
+def test_mirror_all_parallel_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorder: _Recorder
+) -> None:
+    data_dir = tmp_path / "data"
+    # 10 repos, each one challenge; staged concurrently by 4 workers, flushed in 2 batches
+    # of 5. Repos share the same origin/event/year corpus prefix, so this also exercises
+    # the consumer's tree-merge of independent per-repo work dirs into the one batch tree.
+    repos = [f"acme/r{i}" for i in range(10)]
+    mapping = {r: [_make_raw(tmp_path, r, f"c{i}")] for i, r in enumerate(repos)}
+    _patch_discover_by_repo(monkeypatch, mapping)
+
+    results = pipeline.mirror_all(
+        repos,
+        data_dir=data_dir,
+        dataset="acme/ds",
+        publish=True,
+        keep_local=False,
+        max_repo_size_mb=4096,
+        token="t",
+        resume=False,
+        workers=4,
+        batch_size=5,
+    )
+
+    # All 10 processed and marked 'ok' after their batch published — regardless of the
+    # order the parallel producers happened to finish in.
+    assert len(results) == 10
+    assert {r.repo for r in results} == set(repos)
+    assert all(r.status == "ok" for r in results)
+    assert sum(r.n_challenges for r in results) == 10
+
+    # Exactly two batch commits, five repos each (count-triggered flush + final flush).
+    assert len(recorder.corpus_calls) == 2
+    assert len(recorder.catalog_calls) == 2
+    assert [c["n_shards"] for c in recorder.catalog_calls] == [5, 5]
+
+    # Manifest durably records all ten as 'ok'.
+    manifest = data_dir / "mirror_state.jsonl"
+    recs = [json.loads(x) for x in manifest.read_text().splitlines() if x]
+    assert {r["repo"] for r in recs} == set(repos)
+    assert all(r["status"] == "ok" for r in recs)
+
+    # No leftover isolated work dirs and no leftover staging after a successful run.
+    assert not (data_dir / "work").exists()
+    assert not (data_dir / "staging_batch").exists()
 
 
 def test_resolve_repo_list_sources(tmp_path: Path) -> None:
